@@ -5,7 +5,6 @@
 output
 output_2048
 result
-dataset/
 *.pt
 tests/data/asr
 .DS_Store
@@ -196,4 +195,4 @@ eval_results/
 
 # agents
 .claude/settings.local.json
-.dataset/
+dataset/

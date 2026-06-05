@@ -9,7 +9,7 @@ do_testing: False
 pretrained_model: null # path to .nemo file or model name from list_available_models()
 
 model:
-  model_name: conformer_bpe
+  model_name: conformer_char_small
   max_source_len: 128
 
   tokenizer_grapheme:
@@ -21,7 +21,7 @@ model:
     add_punctuation: false # whether to add punctuation symbols
 
   embedding:
-    d_model: 300
+    d_model: 160
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
     feat_in: ${model.embedding.d_model}
@@ -75,7 +75,7 @@ model:
     dataloader_params:
       drop_last: false
       shuffle: true
-      batch_size: 32
+      batch_size: 64
       num_workers: 4
 
   validation_ds:
@@ -87,7 +87,7 @@ model:
     dataloader_params:
       drop_last: false
       shuffle: false
-      batch_size: 32
+      batch_size: 64
       num_workers: 4
 
   test_ds:
@@ -99,7 +99,7 @@ model:
     dataloader_params:
       drop_last: false
       shuffle: false
-      batch_size: 32
+      batch_size: 64
       num_workers: 0
 
   optim:
@@ -127,6 +127,7 @@ trainer:
   num_nodes: 1
   accelerator: gpu
   strategy: auto
+  precision: 16
   accumulate_grad_batches: 1
   enable_checkpointing: False  # Provided by exp_manager
   logger: False  # Provided by exp_manager
