@@ -119,7 +119,7 @@ conda init bash    # 若用 bash
 ```bash
 conda run -n g2p python examples/dataset/generate_g2p_manifest_espeak.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-vocab dataset/normal/en-US/vocab.txt \
+  --output-vocab dataset/release/en-US/vocab.txt \
   --voice en-us \
   --num-samples 100
 ```
@@ -226,7 +226,7 @@ CSV 主要字段：
 ```bash
 python examples/dataset/generate_g2p_manifest_espeak.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-vocab dataset/normal/en-US/vocab.txt \
+  --output-vocab dataset/release/en-US/vocab.txt \
   --voice en-us \
   --no-resume
 ```
@@ -249,19 +249,19 @@ python examples/dataset/generate_g2p_manifest_espeak.py \
 ```bash
 python examples/dataset/generate_g2p_manifest_espeak.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-vocab dataset/normal/en-US/vocab.txt \
+  --output-vocab dataset/release/en-US/vocab.txt \
   --voice en-us
 ```
 
-自动生成：`dataset/normal/en-US/train.json`
+自动生成：`dataset/release/en-US/train.json`
 
 ### 试跑 100 条
 
 ```bash
 python examples/dataset/generate_g2p_manifest_espeak.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-vocab dataset/normal/en-US/vocab.txt \
-  --output-json dataset/normal/en-US/train.json \
+  --output-vocab dataset/release/en-US/vocab.txt \
+  --output-json dataset/release/en-US/train.json \
   --voice en-us \
   --num-samples 100
 ```
@@ -273,8 +273,8 @@ python examples/dataset/generate_g2p_manifest_espeak.py \
 ```bash
 python examples/dataset/generate_g2p_manifest_espeak.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-vocab dataset/normal/en-US/vocab.txt \
-  --output-json dataset/normal/en-US/train.json \
+  --output-vocab dataset/release/en-US/vocab.txt \
+  --output-json dataset/release/en-US/train.json \
   --voice en-us
 ```
 
@@ -283,8 +283,8 @@ python examples/dataset/generate_g2p_manifest_espeak.py \
 ```bash
 python examples/dataset/generate_g2p_manifest_espeak.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-vocab dataset/normal/en-US/vocab.txt \
-  --output-json dataset/normal/en-US/train.json \
+  --output-vocab dataset/release/en-US/vocab.txt \
+  --output-json dataset/release/en-US/train.json \
   --voice en-us \
   --num-workers 8
 ```
@@ -351,23 +351,23 @@ HF_ENDPOINT=https://hf-mirror.com python examples/dataset/download_ipa_childes_s
 # 3. 先试 100 条
 python examples/dataset/generate_g2p_manifest_espeak.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-vocab dataset/normal/en-US/vocab.txt \
-  --output-json dataset/normal/en-US/train.json \
+  --output-vocab dataset/release/en-US/vocab.txt \
+  --output-json dataset/release/en-US/train.json \
   --voice en-us \
   --num-samples 100
 
 # 4. 确认无误后跑全量
 python examples/dataset/generate_g2p_manifest_espeak.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-vocab dataset/normal/en-US/vocab.txt \
-  --output-json dataset/normal/en-US/train.json \
+  --output-vocab dataset/release/en-US/vocab.txt \
+  --output-json dataset/release/en-US/train.json \
   --voice en-us
 ```
 
 最终产物：
 
 ```
-dataset/normal/en-US/
+dataset/release/en-US/
 ├── train.json    # G2P manifest
 └── vocab.txt     # 从 text_graphemes + text 收集的词表
 ```

@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         "--output-vocab",
         type=Path,
         required=True,
-        help="Output vocab.txt：从 JSON 的 text 字段（IPA 音素）收集字符集。",
+        help="Output vocab.txt：从 JSON 的 text_graphemes 与 text 两个字段收集全部字符。",
     )
     parser.add_argument(
         "--text-field",
@@ -190,6 +190,7 @@ def load_vocab_from_json(json_path: Path) -> Set[str]:
             if not line:
                 continue
             entry = json.loads(line)
+            vocab.update(entry["text_graphemes"])
             vocab.update(entry["text"])
     return vocab
 
@@ -384,6 +385,7 @@ def main() -> None:
                         error_count += 1
                         pbar.update(1)
                         continue
+                    collect_chars(entry["text_graphemes"], vocab)
                     collect_chars(entry["text"], vocab)
                     write_buffer.append(json.dumps(entry, ensure_ascii=False))
                     success_count += 1
@@ -400,7 +402,7 @@ def main() -> None:
     total_lines = skip_rows + success_count
 
     print(f"Done. Wrote {success_count} new entries ({total_lines} total) to {output_json}")
-    print(f"Wrote vocab ({char_count} chars from text) to {args.output_vocab}")
+    print(f"Wrote vocab ({char_count} chars from text_graphemes + text) to {args.output_vocab}")
     if error_count:
         print(f"Skipped {error_count} failed samples in this run.")
 
