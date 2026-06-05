@@ -10,7 +10,7 @@ pretrained_model: null # path to .nemo file or model name from list_available_mo
 
 model:
   model_name: conformer_bpe
-  max_source_len: 512
+  max_source_len: 128
 
   tokenizer_grapheme:
     dataset:
@@ -18,7 +18,7 @@ model:
     unk_token: "҂" # in the data, T5 unk_token is still <unk>
     vocab_file: null # will be filled during training
     do_lower: true # whether to lower case graphemes
-    add_punctuation: true # whether to add punctuation symbols
+    add_punctuation: false # whether to add punctuation symbols
 
   embedding:
     d_model: 300
@@ -26,8 +26,8 @@ model:
     _target_: nemo.collections.asr.modules.ConformerEncoder
     feat_in: ${model.embedding.d_model}
     feat_out: -1 # you may set it if you need different output size other than the default d_model
-    n_layers: 16
-    d_model: 176
+    n_layers: 4
+    d_model: 160
 
     # Sub-sampling params
     subsampling: null # vggnet or striding, vggnet may give better results but needs more memory
@@ -44,10 +44,10 @@ model:
     att_context_size: [ -1, -1 ] # -1 means unlimited context
     xscaling: true # scales up the input embeddings by sqrt(d_model)
     untie_biases: true # unties the biases of the TransformerXL layers
-    pos_emb_max_len: 5000
+    pos_emb_max_len: 512
 
     # Convolution module's params
-    conv_kernel_size: 31
+    conv_kernel_size: 15
     conv_norm_type: 'batch_norm' # batch_norm or layer_norm
 
     ### regularization
@@ -104,7 +104,7 @@ model:
 
   optim:
     name: adamw
-    lr: 2.0
+    lr: 0.5
     # optimizer arguments
     betas: [ 0.9, 0.98 ]
     # less necessity for weight_decay as we already have large augmentations with SpecAug
@@ -117,16 +117,16 @@ model:
       name: NoamAnnealing
       d_model: ${model.encoder.d_model}
       # scheduler config override
-      warmup_steps: 10000
+      warmup_steps: 2000
       warmup_ratio: null
       min_lr: 1e-6
 
 trainer:
   devices: 1 # number of gpus
-  max_epochs: 5
+  max_epochs: 30
   num_nodes: 1
   accelerator: gpu
-  strategy: ddp
+  strategy: auto
   accumulate_grad_batches: 1
   enable_checkpointing: False  # Provided by exp_manager
   logger: False  # Provided by exp_manager
