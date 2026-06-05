@@ -9,13 +9,13 @@ do_testing: False
 pretrained_model: null # path to .nemo file or model name from list_available_models()
 
 model:
-  model_name: conformer_char_small
+  model_name: conformer_bpe
   max_source_len: 128
 
   tokenizer_grapheme:
     dataset:
       _target_: nemo.collections.common.tokenizers.char_tokenizer.CharTokenizer
-    unk_token: "҂" # in the data, T5 unk_token is still <unk>
+    unk_token: "<unk>" # in the data, T5 unk_token is still <unk>
     vocab_file: null # will be filled during training
     do_lower: true # whether to lower case graphemes
     add_punctuation: false # whether to add punctuation symbols
@@ -64,7 +64,7 @@ model:
 
   tokenizer:
     dir: null  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (wpe)
-    type: bpe  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
+    type: nemo.collections.common.tokenizers.char_tokenizer.CharTokenizer  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
 
   train_ds:
     manifest_filepath: ${train_manifest}
