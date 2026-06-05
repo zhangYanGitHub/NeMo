@@ -195,6 +195,22 @@ def load_vocab_from_json(json_path: Path) -> Set[str]:
     return vocab
 
 
+def count_valid_rows(csv_path: Path, text_col_idx: int, limit: int = -1) -> int:
+    count = 0
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            if text_col_idx >= len(row):
+                continue
+            if not row[text_col_idx].strip():
+                continue
+            count += 1
+            if limit >= 0 and count >= limit:
+                break
+    return count
+
+
 def iter_text_batches(
     csv_path: Path,
     text_col_idx: int,
@@ -310,17 +326,20 @@ def main() -> None:
     remaining = args.num_samples - skip_rows if args.num_samples >= 0 else None
     map_chunksize = max(1, num_workers * 2)
 
+    if args.num_samples >= 0:
+        total_target = args.num_samples
+    else:
+        print("Counting CSV rows...")
+        total_target = count_valid_rows(args.input_csv, text_col_idx)
+
+    this_run_target = remaining if remaining is not None else max(0, total_target - skip_rows)
+
     print(f"Input CSV: {args.input_csv}")
     print(f"Output JSON: {output_json}")
     print(f"Output vocab: {args.output_vocab}")
     print(f"Voice: {args.voice}")
     print(f"Workers: {num_workers}, batch size: {args.batch_size}, chunksize: {map_chunksize}")
-    if skip_rows:
-        print(f"Resume: skipping first {skip_rows} CSV rows")
-    if remaining is not None:
-        print(f"Processing up to {remaining} new samples...")
-    else:
-        print("Processing all remaining samples...")
+    print(f"Total target: {total_target}, already done: {skip_rows}, this run: {this_run_target}")
 
     success_count = 0
     error_count = 0
@@ -352,20 +371,28 @@ def main() -> None:
                 skip_rows=skip_rows,
                 num_samples=remaining if remaining is not None else -1,
             )
-            for entries in tqdm(
-                executor.map(_process_batch, batches, chunksize=map_chunksize),
+            pbar = tqdm(
+                total=total_target,
+                initial=skip_rows,
                 desc="G2P",
-            ):
+                unit="条",
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            )
+            for entries in executor.map(_process_batch, batches, chunksize=map_chunksize):
                 for entry in entries:
                     if entry is None:
                         error_count += 1
+                        pbar.update(1)
                         continue
                     collect_chars(entry["text_graphemes"], vocab)
                     collect_chars(entry["text"], vocab)
                     write_buffer.append(json.dumps(entry, ensure_ascii=False))
                     success_count += 1
+                    pbar.update(1)
                     if len(write_buffer) >= WRITE_BUFFER_SIZE:
                         flush_buffer(out_f)
+            pbar.close()
             flush_buffer(out_f)
 
     char_count = write_vocab(args.output_vocab, vocab)
