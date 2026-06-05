@@ -40,12 +40,12 @@ class IpaCharTokenizer:
             raise ValueError(f"Missing required token: {pad_token}")
 
         self.vocab: List[str] = vocab
-        self.token_to_id: Dict[str, int] = {t: i for i, t in enumerate(vocab)}
-        self.id_to_token: Dict[int, str] = {i: t for i, t in enumerate(vocab)}
+        self.token2id: Dict[str, int] = {t: i for i, t in enumerate(vocab)}
+        self.id2token: Dict[int, str] = {i: t for i, t in enumerate(vocab)}
 
-        self.unk_id = self.token_to_id[unk_token]
-        self.pad_id = self.token_to_id[pad_token]
-        self.blank_id = self.token_to_id[blank_token] if blank_token and blank_token in self.token_to_id else None
+        self.unk_id = self.token2id[unk_token]
+        self.pad_id = self.token2id[pad_token]
+        self.blank_id = self.token2id[blank_token] if blank_token and blank_token in self.token2id else None
 
         self.tokenizer = self
         self.all_special_tokens = [x for x in [pad_token, unk_token, blank_token] if x is not None]
@@ -58,7 +58,16 @@ class IpaCharTokenizer:
         return len(self.vocab)
 
     def get_vocab(self) -> Dict[str, int]:
-        return dict(self.token_to_id)
+        return dict(self.token2id)
+
+    def token_to_id(self, token: str) -> int:
+        return self.token2id.get(token, self.unk_id)
+
+    def id_to_token(self, idx: int) -> str:
+        idx = int(idx)
+        if idx not in self.id2token:
+            raise ValueError(f"Unknown token id: {idx}")
+        return self.id2token[idx]
 
     def normalize(self, text: Optional[str]) -> str:
         if text is None:
@@ -74,22 +83,19 @@ class IpaCharTokenizer:
     def text_to_tokens(self, text: str) -> List[str]:
         return list(self.normalize(text))
 
+    def tokens_to_text(self, tokens: Iterable[str]) -> str:
+        specials = set(self.all_special_tokens)
+        toks = [t for t in tokens if t not in specials]
+        return "".join(toks)
+
     def tokens_to_ids(self, tokens: Iterable[str]) -> List[int]:
-        return [self.token_to_id.get(t, self.unk_id) for t in tokens]
+        return [self.token_to_id(t) for t in tokens]
 
     def text_to_ids(self, text: str) -> List[int]:
         return self.tokens_to_ids(self.text_to_tokens(text))
 
     def ids_to_tokens(self, ids: Iterable[int]) -> List[str]:
-        toks = []
-        for i in ids:
-            i = int(i)
-            if i not in self.id_to_token:
-                raise ValueError(f"Unknown token id: {i}")
-            toks.append(self.id_to_token[i])
-        return toks
+        return [self.id_to_token(i) for i in ids]
 
     def ids_to_text(self, ids: Iterable[int]) -> str:
-        specials = set(self.all_special_tokens)
-        toks = [t for t in self.ids_to_tokens(ids) if t not in specials]
-        return "".join(toks)
+        return self.tokens_to_text(self.ids_to_tokens(ids))
