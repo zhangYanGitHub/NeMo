@@ -93,7 +93,7 @@ class ASRBPEMixin(ABC):
                 with open_dict(self.cfg.tokenizer):
                     self.cfg.tokenizer.hf_kwargs = tokenizer_cfg.get('hf_kwargs')
 
-        if self.tokenizer_type not in ['bpe', 'wpe']:
+        if self.tokenizer_type not in ['bpe', 'wpe','ipa_char']:
             raise ValueError(
                 "`tokenizer.type` must be either `bpe` for SentencePiece tokenizer or "
                 "`wpe` for BERT based tokenizer"
@@ -154,7 +154,7 @@ class ASRBPEMixin(ABC):
             self.tokenizer.tokenizer.get_vocab = get_vocab
             self.tokenizer.tokenizer.all_special_tokens = self.tokenizer.special_token_to_id
 
-        else:
+        elif self.tokenizer_type == 'wpe':
             # This is a WPE Tokenizer
             # If path from previous registration exists, remove it
             if 'vocab_path' in self.tokenizer_cfg:
@@ -180,6 +180,19 @@ class ASRBPEMixin(ABC):
                 unk_token=self.hf_tokenizer_kwargs.get('unk_token', None),
                 use_fast=self.hf_tokenizer_kwargs.get('use_fast', False),
             )
+
+        elif self.tokenizer_type == 'ipa_char':
+            if 'vocab_path' in self.tokenizer_cfg:
+                vocab_path = self.tokenizer_cfg.get('vocab_path')
+            else:
+                vocab_path = os.path.join(self.tokenizer_dir, 'vocab.txt')
+            vocab_path = self.register_artifact('tokenizer.vocab_path', vocab_path)
+            self.vocab_path = vocab_path
+
+            from nemo.collections.common.tokenizers import IpaCharTokenizer
+            self.tokenizer = IpaCharTokenizer(vocab_file=self.vocab_path)
+        else:
+            raise ValueError(f"Unsupported tokenizer type: {self.tokenizer_type}")
 
         logging.info(
             "Tokenizer {} initialized with {} tokens".format(
