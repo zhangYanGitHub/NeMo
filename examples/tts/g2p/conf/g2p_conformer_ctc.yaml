@@ -64,7 +64,7 @@ model:
 
   tokenizer:
     dir: null  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (wpe)
-    type: nemo.collections.common.tokenizers.char_tokenizer.CharTokenizer  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
+    type: bpe  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
 
   train_ds:
     manifest_filepath: ${train_manifest}
