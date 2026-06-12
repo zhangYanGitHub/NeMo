@@ -93,10 +93,10 @@ class ASRBPEMixin(ABC):
                 with open_dict(self.cfg.tokenizer):
                     self.cfg.tokenizer.hf_kwargs = tokenizer_cfg.get('hf_kwargs')
 
-        if self.tokenizer_type not in ['bpe', 'wpe','ipa_char']:
+        if self.tokenizer_type not in ['bpe', 'wpe', 'ipa_symbol']:
             raise ValueError(
-                "`tokenizer.type` must be either `bpe` for SentencePiece tokenizer or "
-                "`wpe` for BERT based tokenizer"
+                "`tokenizer.type` must be either `bpe` for SentencePiece tokenizer, "
+                "`wpe` for BERT based tokenizer, or `ipa_symbol`"
             )
 
         if self.tokenizer_type == 'bpe':
@@ -181,7 +181,7 @@ class ASRBPEMixin(ABC):
                 use_fast=self.hf_tokenizer_kwargs.get('use_fast', False),
             )
 
-        elif self.tokenizer_type == 'ipa_char':
+        elif self.tokenizer_type == 'ipa_symbol':
             if 'vocab_path' in self.tokenizer_cfg:
                 vocab_path = self.tokenizer_cfg.get('vocab_path')
             else:
@@ -189,8 +189,23 @@ class ASRBPEMixin(ABC):
             vocab_path = self.register_artifact('tokenizer.vocab_path', vocab_path)
             self.vocab_path = vocab_path
 
-            from nemo.collections.common.tokenizers import IpaCharTokenizer
-            self.tokenizer = IpaCharTokenizer(vocab_file=self.vocab_path)
+            from nemo.collections.common.tokenizers import IPASymbolTokenizer
+
+            symbol_kwargs = {
+                k: v
+                for k, v in self.tokenizer_cfg.items()
+                if k
+                in {
+                    'unk_token',
+                    'pad_token',
+                    'blank_token',
+                    'normalization',
+                    'collapse_whitespace',
+                    'strip_text',
+                    'strict_inventory_check',
+                }
+            }
+            self.tokenizer = IPASymbolTokenizer(vocab_file=self.vocab_path, **symbol_kwargs)
         else:
             raise ValueError(f"Unsupported tokenizer type: {self.tokenizer_type}")
 
@@ -259,9 +274,10 @@ class ASRBPEMixin(ABC):
         tokenizer_type = tokenizer_cfg.get('type').lower()
         tokenizer_dir = tokenizer_cfg.get('dir')
 
-        if tokenizer_type not in ['bpe', 'wpe']:
+        if tokenizer_type not in ['bpe', 'wpe', 'ipa_symbol']:
             raise ValueError(
-                '`tokenizer.type` must be either `bpe` for SentencePiece tokenizer or' '`wpe` for BERT based tokenizer'
+                '`tokenizer.type` must be either `bpe` for SentencePiece tokenizer, '
+                '`wpe` for BERT based tokenizer, or `ipa_symbol` for G2P IPA vocab.txt'
             )
 
         # defaults
@@ -327,8 +343,7 @@ class ASRBPEMixin(ABC):
             tokenizer.tokenizer.get_vocab = get_vocab
             tokenizer.tokenizer.all_special_tokens = tokenizer.special_token_to_id
 
-        else:
-            # This is a WPE Tokenizer
+        elif tokenizer_type == 'wpe':
             # If path from previous registration exists, remove it
             if 'vocab_path' in tokenizer_cfg:
                 vocab_path = tokenizer_cfg.get('vocab_path')
@@ -356,6 +371,33 @@ class ASRBPEMixin(ABC):
                 unk_token=hf_tokenizer_kwargs.get('unk_token', None),
                 use_fast=hf_tokenizer_kwargs.get('use_fast', False),
             )
+
+        else:
+            # ipa_symbol: IPASymbolTokenizer (vocab.txt, longest-match IPA + singles)
+            if 'vocab_path' in tokenizer_cfg:
+                vocab_path = tokenizer_cfg.get('vocab_path')
+            else:
+                vocab_path = os.path.join(tokenizer_dir, 'vocab.txt')
+
+            vocab_path = self.register_artifact(
+                'tokenizer.' + self.AGGREGATE_TOKENIZERS_DICT_PREFIX + '.' + lang + '.vocab_path', vocab_path
+            )
+
+            symbol_kwargs = {
+                k: v
+                for k, v in tokenizer_cfg.items()
+                if k
+                in {
+                    'unk_token',
+                    'pad_token',
+                    'blank_token',
+                    'normalization',
+                    'collapse_whitespace',
+                    'strip_text',
+                    'strict_inventory_check',
+                }
+            }
+            tokenizer = tokenizers.IPASymbolTokenizer(vocab_file=vocab_path, **symbol_kwargs)
 
         logging.info(
             'Tokenizer {} initialized with {} tokens'.format(tokenizer.__class__.__name__, tokenizer.vocab_size)

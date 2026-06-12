@@ -64,7 +64,8 @@ model:
 
   tokenizer:
     dir: null  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (wpe)
-    type: ipa_char  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
+    # ipa_symbol -> IPASymbolTokenizer (longest-match multi-char vocab + singles); see ipa_symbol_tokenizer.py
+    type: ipa_symbol
 
   train_ds:
     manifest_filepath: ${train_manifest}

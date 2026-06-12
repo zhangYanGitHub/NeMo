@@ -1,14 +1,26 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import unicodedata
+import warnings
 from typing import Dict, Iterable, List, Optional
 
 
-class IpaCharTokenizer:
-    """
-    Minimal IPA character tokenizer for G2P targets.
-    Uses only vocab.txt, no extra config file.
-    """
+class IPASymbolTokenizer:
+    """IPA tokenizer using vocab.txt with longest-match tokenization."""
 
     def __init__(
         self,
@@ -19,21 +31,22 @@ class IpaCharTokenizer:
         normalization: str = "NFC",
         collapse_whitespace: bool = True,
         strip_text: bool = True,
+        strict_inventory_check: bool = False,
     ):
-        self.vocab_file = str(vocab_file)
+        self.vocab_file = vocab_file
         self.unk_token = unk_token
         self.pad_token = pad_token
         self.blank_token = blank_token
         self.normalization = normalization
         self.collapse_whitespace = collapse_whitespace
         self.strip_text = strip_text
+        self.strict_inventory_check = strict_inventory_check
 
         with open(vocab_file, "r", encoding="utf-8") as f:
             vocab = [line.rstrip("\n") for line in f]
 
         if len(vocab) != len(set(vocab)):
             raise ValueError("Duplicate tokens found in vocab.txt")
-
         if unk_token not in vocab:
             raise ValueError(f"Missing required token: {unk_token}")
         if pad_token not in vocab:
@@ -42,13 +55,38 @@ class IpaCharTokenizer:
         self.vocab: List[str] = vocab
         self.token2id: Dict[str, int] = {t: i for i, t in enumerate(vocab)}
         self.id2token: Dict[int, str] = {i: t for i, t in enumerate(vocab)}
-
         self.unk_id = self.token2id[unk_token]
         self.pad_id = self.token2id[pad_token]
         self.blank_id = self.token2id[blank_token] if blank_token and blank_token in self.token2id else None
+        self.all_special_tokens = [x for x in (pad_token, unk_token, blank_token) if x is not None]
+        self.special_token_set = set(self.all_special_tokens)
 
+        lexical_tokens = [t for t in vocab if t not in self.special_token_set]
+        self.multi_tokens = sorted([t for t in lexical_tokens if len(t) > 1], key=lambda x: (-len(x), x))
+        self.single_tokens = set(t for t in lexical_tokens if len(t) == 1)
+
+        self._check_token_inventory()
         self.tokenizer = self
-        self.all_special_tokens = [x for x in [pad_token, unk_token, blank_token] if x is not None]
+
+    def _check_token_inventory(self) -> None:
+        missing_parts = []
+        for tok in self.multi_tokens:
+            for ch in tok:
+                if ch not in self.single_tokens and ch != " ":
+                    missing_parts.append((tok, ch))
+
+        if not missing_parts:
+            return
+
+        preview = ", ".join(f"{tok!r}->{ch!r}" for tok, ch in missing_parts[:10])
+        message = (
+            "Some multi-tokens contain characters missing from single-character vocab: "
+            f"{preview}"
+        )
+
+        if self.strict_inventory_check:
+            raise ValueError(message)
+        warnings.warn(message)
 
     def __len__(self) -> int:
         return self.vocab_size
@@ -81,11 +119,34 @@ class IpaCharTokenizer:
         return text
 
     def text_to_tokens(self, text: str) -> List[str]:
-        return list(self.normalize(text))
+        text = self.normalize(text)
+        tokens: List[str] = []
+        i = 0
+        n = len(text)
+
+        while i < n:
+            matched = None
+            for tok in self.multi_tokens:
+                if text.startswith(tok, i):
+                    matched = tok
+                    break
+
+            if matched is not None:
+                tokens.append(matched)
+                i += len(matched)
+                continue
+
+            ch = text[i]
+            if ch in self.single_tokens:
+                tokens.append(ch)
+            else:
+                tokens.append(self.unk_token)
+            i += 1
+
+        return tokens
 
     def tokens_to_text(self, tokens: Iterable[str]) -> str:
-        specials = set(self.all_special_tokens)
-        toks = [t for t in tokens if t not in specials]
+        toks = [t for t in tokens if t not in self.special_token_set]
         return "".join(toks)
 
     def tokens_to_ids(self, tokens: Iterable[str]) -> List[int]:
