@@ -12,8 +12,9 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 from tqdm import tqdm
 
 
-# Base candidate set for espeak-ng en-US multi-character IPA units.
-# Final vocab only keeps tokens actually observed in generated IPA output.
+# Curated en-US espeak-ng multi-character IPA units.
+# These are always written into vocab.txt so the tokenizer can do longest-match
+# tokenization even if some units are rare in the sampled manifest.
 DEFAULT_EN_US_ESPEAK_IPA_TOKENS: Tuple[str, ...] = (
     # Affricates: tied and untied forms
     "t͡ʃ",
@@ -322,13 +323,16 @@ def verify_resume_alignment(csv_path: Path, text_col_idx: int, skip_rows: int, m
     if not expected:
         print("Warning: resume metadata has no last_text_sha1; cannot verify alignment robustly.")
         return
+
     last_text = None
     for idx, text in enumerate(iter_valid_texts(csv_path, text_col_idx), start=1):
         if idx == skip_rows:
             last_text = text
             break
+
     if last_text is None:
         raise RuntimeError("Resume verification failed: CSV has fewer valid rows than existing manifest lines.")
+
     actual = fingerprint_text(last_text)
     if actual != expected:
         raise RuntimeError(
@@ -374,12 +378,12 @@ def main() -> None:
         (t for t in DEFAULT_EN_US_ESPEAK_IPA_TOKENS if len(t) >= 2),
         key=lambda x: (-len(x), x),
     )
+    forced_multitokens = set(candidate_multi_sorted)
 
     if file_mode == "done":
         vocab = load_vocab_for_resume(output_json, cache_path)
-        observed = collect_observed_from_manifest(output_json, candidate_multi_sorted)
-        char_count, multi_count = write_vocab(args.output_vocab, vocab, observed)
-        print(f"Wrote vocab ({char_count} single-char tokens, {multi_count} multi-char IPA) to {args.output_vocab}")
+        char_count, multi_count = write_vocab(args.output_vocab, vocab, forced_multitokens)
+        print(f"Wrote vocab ({char_count} single-char tokens, {multi_count} forced multi-char IPA) to {args.output_vocab}")
         return
 
     remaining = args.num_samples - skip_rows if args.num_samples >= 0 else None
@@ -408,17 +412,17 @@ def main() -> None:
             out_f.write("\n".join(write_buffer))
             out_f.write("\n")
             write_buffer = []
-            save_vocab_cache(cache_path, vocab)
-            save_resume_meta(
-                meta_path,
-                {
-                    "input_csv": str(args.input_csv),
-                    "text_field": args.text_field,
-                    "voice": args.voice,
-                    "processed_lines": skip_rows + success_count,
-                    "last_text_sha1": fingerprint_text(last_success_text) if last_success_text else None,
-                },
-            )
+        save_vocab_cache(cache_path, vocab)
+        save_resume_meta(
+            meta_path,
+            {
+                "input_csv": str(args.input_csv),
+                "text_field": args.text_field,
+                "voice": args.voice,
+                "processed_lines": skip_rows + success_count,
+                "last_text_sha1": fingerprint_text(last_success_text) if last_success_text else None,
+            },
+        )
 
     failed_mode = "a" if (args.resume and failed_log.exists()) else "w"
     with output_json.open(file_mode, encoding="utf-8") as out_f, failed_log.open(failed_mode, encoding="utf-8") as fail_f:
@@ -430,6 +434,7 @@ def main() -> None:
                 skip_rows,
                 remaining if remaining is not None else -1,
             )
+
             pbar = tqdm(total=total_target, initial=skip_rows, desc="G2P", unit="rows", dynamic_ncols=True)
             for entries in executor.map(_process_batch, batches, chunksize=map_chunksize):
                 for entry in entries:
@@ -443,6 +448,7 @@ def main() -> None:
                     text_ipa = str(entry["text"])
                     collect_chars(text_g, vocab)
                     collect_chars(text_ipa, vocab)
+
                     if candidate_multi_sorted:
                         collect_observed_multitokens(text_ipa, candidate_multi_sorted, observed_multitokens)
 
@@ -450,12 +456,15 @@ def main() -> None:
                     success_count += 1
                     last_success_text = text_g
                     pbar.update(1)
+
                     if len(write_buffer) >= WRITE_BUFFER_SIZE:
                         flush_buffer(out_f)
+
             pbar.close()
             flush_buffer(out_f)
 
-    char_count, multi_count = write_vocab(args.output_vocab, vocab, observed_multitokens)
+    char_count, multi_count = write_vocab(args.output_vocab, vocab, forced_multitokens)
+
     if cache_path.exists():
         cache_path.unlink()
 
@@ -472,7 +481,10 @@ def main() -> None:
     )
 
     print(f"Done. Wrote {success_count} new entries ({total_lines} total) to {output_json}")
-    print(f"Wrote vocab ({char_count} single-char from text_graphemes + text, {multi_count} multi-char IPA) to {args.output_vocab}")
+    print(
+        f"Wrote vocab ({char_count} single-char from text_graphemes + text, "
+        f"{multi_count} forced multi-char IPA) to {args.output_vocab}"
+    )
     if error_count:
         print(f"Logged {error_count} failed samples to {failed_log}")
 
