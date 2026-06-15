@@ -19,6 +19,30 @@ import warnings
 from typing import Dict, Iterable, List, Optional
 
 
+class _MultiTokenTrieNode:
+    """Prefix tree node for longest-match over multi-character vocab tokens."""
+
+    __slots__ = ("children", "token")
+
+    def __init__(self) -> None:
+        self.children: Dict[str, _MultiTokenTrieNode] = {}
+        self.token: Optional[str] = None  # full multi-token ending at this node
+
+
+def _build_multi_token_trie(multi_tokens: List[str]) -> _MultiTokenTrieNode:
+    root = _MultiTokenTrieNode()
+    for tok in multi_tokens:
+        node = root
+        for ch in tok:
+            nxt = node.children.get(ch)
+            if nxt is None:
+                nxt = _MultiTokenTrieNode()
+                node.children[ch] = nxt
+            node = nxt
+        node.token = tok
+    return root
+
+
 class IPASymbolTokenizer:
     """IPA tokenizer using vocab.txt with longest-match tokenization."""
 
@@ -64,6 +88,7 @@ class IPASymbolTokenizer:
         lexical_tokens = [t for t in vocab if t not in self.special_token_set]
         self.multi_tokens = sorted([t for t in lexical_tokens if len(t) > 1], key=lambda x: (-len(x), x))
         self.single_tokens = set(t for t in lexical_tokens if len(t) == 1)
+        self._multi_trie_root = _build_multi_token_trie(self.multi_tokens)
 
         self._check_token_inventory()
         self.tokenizer = self
@@ -103,9 +128,9 @@ class IPASymbolTokenizer:
 
     def id_to_token(self, idx: int) -> str:
         idx = int(idx)
-        if idx not in self.id2token:
+        if not (0 <= idx < len(self.vocab)):
             raise ValueError(f"Unknown token id: {idx}")
-        return self.id2token[idx]
+        return self.vocab[idx]
 
     def normalize(self, text: Optional[str]) -> str:
         if text is None:
@@ -124,12 +149,19 @@ class IPASymbolTokenizer:
         i = 0
         n = len(text)
 
+        root = self._multi_trie_root
         while i < n:
-            matched = None
-            for tok in self.multi_tokens:
-                if text.startswith(tok, i):
-                    matched = tok
+            node = root
+            j = i
+            matched: Optional[str] = None
+            while j < n:
+                nxt = node.children.get(text[j])
+                if nxt is None:
                     break
+                node = nxt
+                j += 1
+                if node.token is not None:
+                    matched = node.token
 
             if matched is not None:
                 tokens.append(matched)
@@ -150,7 +182,9 @@ class IPASymbolTokenizer:
         return "".join(toks)
 
     def tokens_to_ids(self, tokens: Iterable[str]) -> List[int]:
-        return [self.token_to_id(t) for t in tokens]
+        unk_id = self.unk_id
+        t2i = self.token2id
+        return [t2i.get(t, unk_id) for t in tokens]
 
     def text_to_ids(self, text: str) -> List[int]:
         return self.tokens_to_ids(self.text_to_tokens(text))
