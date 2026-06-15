@@ -330,6 +330,135 @@ python examples/dataset/generate_g2p_manifest_espeak.py \
 
 ---
 
+## G2P 训练 checkpoint 与 manifest 后处理
+
+### 将 Lightning `.ckpt` 导出为 NeMo `.nemo`
+
+训练得到的 `.ckpt` 不是 NeMo 推理入口直接使用的 `.nemo` 包。在**已安装 NeMo** 的环境中，于仓库根目录执行（按需修改 `CKPT`、`OUT_NEMO`）：
+
+```bash
+CKPT="exp/g2p_en_us_260w/conformer_ctc_en_us_260w/2026-06-12_09-48-39/checkpoints/conformer_ctc_en_us_260w--val_per=0.0008-epoch=64.ckpt" \
+OUT_NEMO="exp/g2p_en_us_260w/conformer_ctc_en_us_260w/2026-06-12_09-48-39/conformer_ctc_en_us_260w--val_per=0.0008-epoch=64.nemo" \
+python -c "
+import os
+from nemo.collections.tts.g2p.models.ctc import CTCG2PModel
+ckpt = os.environ['CKPT']
+out = os.environ['OUT_NEMO']
+model = CTCG2PModel.load_from_checkpoint(ckpt, map_location='cpu')
+model.save_to(out)
+print('saved:', out)
+"
+```
+
+若希望单行内联路径（不设环境变量），等价写法为：
+
+```bash
+python -c "
+from nemo.collections.tts.g2p.models.ctc import CTCG2PModel
+m = CTCG2PModel.load_from_checkpoint(
+    'exp/g2p_en_us_260w/conformer_ctc_en_us_260w/2026-06-12_09-48-39/checkpoints/conformer_ctc_en_us_260w--val_per=0.0008-epoch=64.ckpt',
+    map_location='cpu',
+)
+m.save_to('exp/g2p_en_us_260w/conformer_ctc_en_us_260w/2026-06-12_09-48-39/conformer_ctc_en_us_260w--val_per=0.0008-epoch=64.nemo')
+"
+```
+
+导出后的 `.nemo` 可用于 `examples/tts/g2p/g2p_inference.py` 的 `pretrained_model=` 参数（见该脚本文件头用法）。
+
+### 导出 ONNX（Conformer CTC G2P，`.nemo` 与 `.ckpt`）
+
+`CTCG2PModel` 实现 `Exportable`，加载权重后调用 `model.export(...)` 即可得到 ONNX。需要环境已安装 NeMo，并具备 ONNX 相关依赖（常见为 `pip install onnx`；导出时若缺包按报错补装即可）。
+
+**说明：** 同一次训练若 `.ckpt` 与 `.nemo` 只是同一权重的两种存储形式，**任选一种加载再导出即可**，得到的部署图应一致。只有在你想对比两种加载路径是否一致时，才需要各导出一个 ONNX（例如不同后缀）。
+
+下面假设 checkpoint 与 `.nemo` 均在同一实验目录下（按你的实际文件名修改 `NEMO`、`CKPT`）：
+
+```bash
+DIR="exp/g2p_en_us_260w/conformer_ctc_en_us_260w/2026-06-12_09-48-39"
+CKPT="${DIR}/checkpoints/conformer_ctc_en_us_260w--val_per=0.0008-epoch=64.ckpt"
+NEMO="${DIR}/conformer_ctc_en_us_260w--val_per=0.0008-epoch=64.nemo"
+OUT_FROM_NEMO="${DIR}/conformer_ctc_en_us_260w_from_nemo.onnx"
+OUT_FROM_CKPT="${DIR}/conformer_ctc_en_us_260w_from_ckpt.onnx"
+
+# 1) 从 .nemo 导出
+NEMO="$NEMO" OUT_ONNX="$OUT_FROM_NEMO" python -c "
+import os
+from nemo.collections.tts.g2p.models.ctc import CTCG2PModel
+path = os.environ['NEMO']
+out = os.environ['OUT_ONNX']
+m = CTCG2PModel.restore_from(path, map_location='cpu')
+m.eval()
+m.export(out)
+print('saved:', out)
+"
+
+# 2) 从 .ckpt 导出（与上一步二选一即可，不必两条都跑）
+CKPT="$CKPT" OUT_ONNX="$OUT_FROM_CKPT" python -c "
+import os
+from nemo.collections.tts.g2p.models.ctc import CTCG2PModel
+path = os.environ['CKPT']
+out = os.environ['OUT_ONNX']
+m = CTCG2PModel.load_from_checkpoint(path, map_location='cpu')
+m.eval()
+m.export(out)
+print('saved:', out)
+"
+```
+
+有 GPU 时可将 `map_location='cpu'` 改为 `'cuda:0'` 并把模型 `m.to('cuda')` 后再 `export`（部分算子 GPU 上追踪更省事，视环境而定）。
+
+ONNX 的输入/输出与 `nemo/collections/tts/g2p/models/ctc.py` 中 `forward_for_export` 一致：**输入** `input_ids`、`input_len`；**输出** `log_probs`、`encoded_len`。部署侧仍需用与训练一致的 grapheme tokenizer 将文本编成 `input_ids`，并用与原模型相同的 CTC 解码（词表在 `.nemo` / checkpoint 内）将 `log_probs` 转为音素串。
+
+### 从 manifest 提取 grapheme 文本行（`extract_graphemes_from_manifest.py`）
+
+脚本路径：`examples/dataset/extract_graphemes_from_manifest.py`。**不加载任何模型**，只读本地 **JSONL**（一行一个 JSON 对象），从每行取出 `text_graphemes`，写入 **UTF-8 纯文本**（与上文的 `.ckpt` / `.nemo` 无关）。
+
+#### 输入需要满足什么
+
+- **文件**：`--input` 指向的 JSONL；编码按实现以 **二进制** 读取，约定为 **UTF-8**（与本目录 `generate_g2p_manifest_espeak.py` 写出的 `train.json` 一致即可）。
+- **每行**：应能解析出非空的 `text_graphemes`（取前会做 `strip`，全空则**跳过该行不写输出**）。
+- **快速路径（默认优先）**：若一行以字节序列 `{"text_graphemes": "` 开头，且其后能匹配到**第一次**出现的 `", "text":`，则把这两段之间的内容当作 grapheme 串写出（**不做 JSON 字符串转义解码**，与 NeMo 常见「`text_graphemes` 在前、`text` 在后」的 manifest 一致时最快）。若行格式不满足（例如字段顺序相反、或没有紧跟的 `", "text":`），则走 **回退路径**：整行 `json.loads`（若安装了 `orjson` 则优先 `orjson.loads`），再取 `text_graphemes` 键。
+- **不会写入输出行的情况**：取不到 `text_graphemes`、值为空、或解析失败（静默跳过）。
+
+#### 输出是什么
+
+- **文件**：`--output` 路径；父目录不存在会自动创建。
+- **内容**：每个成功提取的 `text_graphemes` **占一行**；行与行之间为换行符 `\n`（实现里用 `\n` 拼接写入）。
+- **结束**：脚本在 stdout 打印 `Wrote <条数> grapheme lines to <output> (<workers> worker(s))`。
+
+#### 命令行参数（与 `parse_args()` 一致）
+
+| 参数 | 必填 | 默认 | 含义 |
+|------|------|------|------|
+| `--input` | 是 | — | 输入 JSONL manifest 路径 |
+| `--output` | 是 | — | 输出 `.txt`（或其它后缀）路径 |
+| `--workers` | 否 | `0` | 并行进程数；`0` 表示用 **`os.cpu_count()`**；**`1`** 表示单进程、不分片 |
+| `--progress` | 否 | 关 | 显示进度条（需安装 **`tqdm`**） |
+| `--write-buffer-lines` | 否 | `8192` | 每个 worker 累计多少行再 flush 一次（调 I/O，一般不用改） |
+
+#### 示例命令（仓库根目录）
+
+与本 README 前文生成的 manifest 一致时：
+
+```bash
+python examples/dataset/extract_graphemes_from_manifest.py \
+  --input dataset/release/en-US/train.json \
+  --output dataset/release/en-US/graphemes_from_manifest.txt \
+  --progress
+```
+
+强制单进程（便于调试或避免占满 CPU）：
+
+```bash
+python examples/dataset/extract_graphemes_from_manifest.py \
+  --input dataset/release/en-US/train.json \
+  --output dataset/release/en-US/graphemes_from_manifest.txt \
+  --workers 1 \
+  --progress
+```
+
+---
+
 ## 完整示例（en-US）
 
 在仓库根目录依次执行：

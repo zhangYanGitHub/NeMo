@@ -1,22 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from __future__ import annotations
 
 import unicodedata
 import warnings
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 
 class _MultiTokenTrieNode:
@@ -26,7 +12,7 @@ class _MultiTokenTrieNode:
 
     def __init__(self) -> None:
         self.children: Dict[str, _MultiTokenTrieNode] = {}
-        self.token: Optional[str] = None  # full multi-token ending at this node
+        self.token: Optional[str] = None
 
 
 def _build_multi_token_trie(multi_tokens: List[str]) -> _MultiTokenTrieNode:
@@ -44,7 +30,7 @@ def _build_multi_token_trie(multi_tokens: List[str]) -> _MultiTokenTrieNode:
 
 
 class IPASymbolTokenizer:
-    """IPA tokenizer using vocab.txt with longest-match tokenization."""
+    """IPA tokenizer using vocab.txt or in-memory vocab with longest-match tokenization."""
 
     def __init__(
         self,
@@ -57,6 +43,91 @@ class IPASymbolTokenizer:
         strip_text: bool = True,
         strict_inventory_check: bool = False,
     ):
+        with open(vocab_file, "r", encoding="utf-8") as f:
+            vocab = [line.rstrip("\n") for line in f]
+        self._init_from_vocab(
+            vocab=vocab,
+            vocab_file=vocab_file,
+            unk_token=unk_token,
+            pad_token=pad_token,
+            blank_token=blank_token,
+            normalization=normalization,
+            collapse_whitespace=collapse_whitespace,
+            strip_text=strip_text,
+            strict_inventory_check=strict_inventory_check,
+        )
+
+    @classmethod
+    def from_vocab_list(
+        cls,
+        vocab: Sequence[str],
+        *,
+        unk_token: str = "<unk>",
+        pad_token: str = "<pad>",
+        blank_token: Optional[str] = None,
+        normalization: str = "NFC",
+        collapse_whitespace: bool = True,
+        strip_text: bool = True,
+        strict_inventory_check: bool = False,
+    ) -> "IPASymbolTokenizer":
+        obj = cls.__new__(cls)
+        obj._init_from_vocab(
+            vocab=list(vocab),
+            vocab_file="<in_memory>",
+            unk_token=unk_token,
+            pad_token=pad_token,
+            blank_token=blank_token,
+            normalization=normalization,
+            collapse_whitespace=collapse_whitespace,
+            strip_text=strip_text,
+            strict_inventory_check=strict_inventory_check,
+        )
+        return obj
+
+    @classmethod
+    def from_meta(
+        cls,
+        meta: Dict[str, object],
+        *,
+        vocab_key: str = "phoneme_labels",
+        normalization: str = "NFC",
+        collapse_whitespace: bool = True,
+        strip_text: bool = True,
+        strict_inventory_check: bool = False,
+    ) -> "IPASymbolTokenizer":
+        vocab = meta.get(vocab_key)
+        if not isinstance(vocab, list) or not vocab:
+            raise ValueError(f"meta[{vocab_key!r}] 必须是非空 list")
+
+        if "<pad>" not in vocab:
+            raise ValueError("phoneme_labels 中缺少 <pad>")
+        if "<unk>" not in vocab:
+            raise ValueError("phoneme_labels 中缺少 <unk>")
+
+        return cls.from_vocab_list(
+            vocab=vocab,
+            unk_token="<unk>",
+            pad_token="<pad>",
+            blank_token=None,
+            normalization=normalization,
+            collapse_whitespace=collapse_whitespace,
+            strip_text=strip_text,
+            strict_inventory_check=strict_inventory_check,
+        )
+
+    def _init_from_vocab(
+        self,
+        *,
+        vocab: List[str],
+        vocab_file: str,
+        unk_token: str,
+        pad_token: str,
+        blank_token: Optional[str],
+        normalization: str,
+        collapse_whitespace: bool,
+        strip_text: bool,
+        strict_inventory_check: bool,
+    ) -> None:
         self.vocab_file = vocab_file
         self.unk_token = unk_token
         self.pad_token = pad_token
@@ -66,11 +137,8 @@ class IPASymbolTokenizer:
         self.strip_text = strip_text
         self.strict_inventory_check = strict_inventory_check
 
-        with open(vocab_file, "r", encoding="utf-8") as f:
-            vocab = [line.rstrip("\n") for line in f]
-
         if len(vocab) != len(set(vocab)):
-            raise ValueError("Duplicate tokens found in vocab.txt")
+            raise ValueError("Duplicate tokens found in vocab")
         if unk_token not in vocab:
             raise ValueError(f"Missing required token: {unk_token}")
         if pad_token not in vocab:
@@ -108,7 +176,6 @@ class IPASymbolTokenizer:
             "Some multi-tokens contain characters missing from single-character vocab: "
             f"{preview}"
         )
-
         if self.strict_inventory_check:
             raise ValueError(message)
         warnings.warn(message)
@@ -148,12 +215,13 @@ class IPASymbolTokenizer:
         tokens: List[str] = []
         i = 0
         n = len(text)
-
         root = self._multi_trie_root
+
         while i < n:
             node = root
             j = i
             matched: Optional[str] = None
+
             while j < n:
                 nxt = node.children.get(text[j])
                 if nxt is None:
