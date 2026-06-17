@@ -1,8 +1,10 @@
+# 端侧最小 Conformer-CTC G2P：用于替换 espeak-ng 路线上的体积/时延基线（需自行训练后才有正确读音）。
+# 随机初始化 .nemo 见下方「导出未训练 ckpt」命令。
 name: G2P-Conformer-CTC
 
-# Dataset info
-train_manifest: ???
-validation_manifest: ???
+# 训练时改为你的 jsonl manifest；仅导出随机 ckpt 时可保持 null
+train_manifest: null
+validation_manifest: null
 test_manifest: null
 do_training: True
 do_testing: False
@@ -10,128 +12,118 @@ pretrained_model: null # path to .nemo file or model name from list_available_mo
 
 model:
   model_name: conformer_bpe
-  max_source_len: 128
+  # 单词级 G2P 一般远小于 128；可按最长词再调大
+  max_source_len: 64
 
   tokenizer_grapheme:
     dataset:
       _target_: nemo.collections.common.tokenizers.char_tokenizer.CharTokenizer
-    unk_token: "<unk>" # in the data, T5 unk_token is still <unk>
-    vocab_file: null # will be filled during training
-    do_lower: true # whether to lower case graphemes
-    add_punctuation: false # whether to add punctuation symbols
+    unk_token: "<unk>"
+    vocab_file: null
+    do_lower: true
+    add_punctuation: false
 
   embedding:
-    d_model: 512
+    d_model: 128
+
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
     feat_in: ${model.embedding.d_model}
-    feat_out: -1 # you may set it if you need different output size other than the default d_model
-    n_layers: 12
-    d_model: 512
+    feat_out: -1
+    n_layers: 4
+    d_model: 128
 
-    # Sub-sampling params
-    subsampling: null # vggnet or striding, vggnet may give better results but needs more memory
-    subsampling_factor: 1 # must be power of 2
-    subsampling_conv_channels: -1 # set to -1 to make it equal to the d_model
+    # 下采样缩短时间维，利于端上时延（短序列也通常略快）
+    subsampling: striding
+    subsampling_factor: 2
+    subsampling_conv_channels: -1
 
-    # Feed forward module's params
-    ff_expansion_factor: 4
+    ff_expansion_factor: 2
 
-    # Multi-headed Attention Module's params
-    self_attention_model: rel_pos # rel_pos or abs_pos
-    n_heads: 8 # may need to be lower for smaller d_models
-    # [left, right] specifies the number of steps to be seen from left and right of each step in self-attention
-    att_context_size: [ -1, -1 ] # -1 means unlimited context
-    xscaling: true # scales up the input embeddings by sqrt(d_model)
-    untie_biases: true # unties the biases of the TransformerXL layers
-    pos_emb_max_len: 1024
+    self_attention_model: rel_pos
+    n_heads: 4
+    att_context_size: [ -1, -1 ]
+    xscaling: true
+    untie_biases: true
+    pos_emb_max_len: 256
 
-    # Convolution module's params
-    conv_kernel_size: 31
-    conv_norm_type: 'batch_norm' # batch_norm or layer_norm
+    conv_kernel_size: 15
+    conv_norm_type: layer_norm
 
-    ### regularization
-    dropout: 0.1 # The dropout used in most of the Conformer Modules
-    dropout_pre_encoder: 0.1 # The dropout used before the encoder
-    dropout_emb: 0.0 # The dropout used for embeddings
-    dropout_att: 0.1 # The dropout for multi-headed attention modules
+    dropout: 0.0
+    dropout_pre_encoder: 0.0
+    dropout_emb: 0.0
+    dropout_att: 0.0
 
   decoder:
     _target_: nemo.collections.asr.modules.ConvASRDecoder
-    feat_in: null # will be filled during training based on encoder model dim
+    feat_in: null
     num_classes: -1
-    vocabulary: null # will be filled during training
+    vocabulary: null
 
   tokenizer:
-    dir: null  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (wpe)
-    # ipa_symbol -> IPASymbolTokenizer (longest-match multi-char vocab + singles); see ipa_symbol_tokenizer.py
+    # ipa_symbol：目录内需有 vocab.txt（此处使用仓库内 en-US 音素表）
+    dir: dataset/normal/en-US
     type: ipa_symbol
 
   train_ds:
     manifest_filepath: ${train_manifest}
     dataset:
       _target_: "nemo.collections.tts.g2p.data.ctc.CTCG2PBPEDataset"
-      phoneme_field: "text" # name of the field in manifest_filepath for ground truth phonemes
-      grapheme_field: "text_graphemes" # name of the field in manifest_filepath for input grapheme text
+      phoneme_field: "text"
+      grapheme_field: "text_graphemes"
     dataloader_params:
       drop_last: false
       shuffle: true
-      batch_size: 16
-      num_workers: 4
+      batch_size: 8
+      num_workers: 2
 
   validation_ds:
     manifest_filepath: ${validation_manifest}
     dataset:
       _target_: "nemo.collections.tts.g2p.data.ctc.CTCG2PBPEDataset"
-      phoneme_field: "text" # name of the field in manifest_filepath for ground truth phonemes
-      grapheme_field: "text_graphemes" # name of the field in manifest_filepath for input grapheme text
+      phoneme_field: "text"
+      grapheme_field: "text_graphemes"
     dataloader_params:
       drop_last: false
       shuffle: false
-      batch_size: 16
-      num_workers: 4
+      batch_size: 8
+      num_workers: 2
 
   test_ds:
     manifest_filepath: ${test_manifest}
     dataset:
       _target_: "nemo.collections.tts.g2p.data.ctc.CTCG2PBPEDataset"
-      phoneme_field: "text" # name of the field in manifest_filepath for ground truth phonemes
-      grapheme_field: "text_graphemes" # name of the field in manifest_filepath for input grapheme text
+      phoneme_field: "text"
+      grapheme_field: "text_graphemes"
     dataloader_params:
       drop_last: false
       shuffle: false
-      batch_size: 16
+      batch_size: 8
       num_workers: 0
 
   optim:
     name: adamw
     lr: 1.0
-    # optimizer arguments
     betas: [ 0.9, 0.98 ]
-    # less necessity for weight_decay as we already have large augmentations with SpecAug
-    # you may need weight_decay for large models, stable AMP training, small datasets, or when lower augmentations are used
-    # weight decay of 0.0 with lr of 2.0 also works fine
     weight_decay: 1e-3
-
-    # scheduler setup
     sched:
       name: NoamAnnealing
       d_model: ${model.encoder.d_model}
-      # scheduler config override
-      warmup_steps: 2000
+      warmup_steps: 1000
       warmup_ratio: null
       min_lr: 1e-6
 
 trainer:
-  devices: 1 # number of gpus
+  devices: 1
   max_epochs: 30
   num_nodes: 1
-  accelerator: gpu
+  accelerator: auto
   strategy: auto
-  precision: 16
+  precision: 32
   accumulate_grad_batches: 1
-  enable_checkpointing: False  # Provided by exp_manager
-  logger: False  # Provided by exp_manager
+  enable_checkpointing: False
+  logger: False
   log_every_n_steps: 200
   check_val_every_n_epoch: 1
 
