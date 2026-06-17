@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build a randomly initialized CTC Conformer G2P checkpoint (.nemo) without training.
+"""随机初始化 CTC Conformer G2P，导出 **.ckpt**（不经训练）。
 
-Use this to benchmark on-device latency / export before you have trained weights.
+- ``lightning``（默认）：PyTorch Lightning 检查点，可用 ``CTCG2PModel.load_from_checkpoint(path)`` 加载。
+- ``weights``：与 .nemo 包内 ``model_weights.ckpt`` 相同，仅为 ``state_dict``；需先有 ``model_config.yaml``
+  再用 ``from_config_dict`` 建模型后 ``load_state_dict``。
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import argparse
 from pathlib import Path
 
 import lightning.pytorch as pl
+import torch
 from omegaconf import OmegaConf
 
 from nemo.collections.tts.g2p.models.ctc import CTCG2PModel
@@ -35,27 +38,38 @@ def main() -> None:
         "--config",
         type=Path,
         default=default_conf,
-        help="Full Hydra-style YAML (same keys as training config).",
+        help="完整 YAML（与训练配置同一套键）。",
     )
     parser.add_argument(
         "--out",
         type=Path,
-        default=Path("g2p_conformer_ctc_edge_random.nemo"),
-        help="Output .nemo path.",
+        default=Path("g2p_conformer_ctc_edge_random.ckpt"),
+        help="输出 .ckpt 路径。",
     )
     parser.add_argument(
         "--tokenizer-dir",
         type=Path,
         default=None,
-        help="Directory that contains vocab.txt for ipa_symbol tokenizer. "
-        "Default: use model.tokenizer.dir from the YAML (g2p_conformer_ctc.yaml points to dataset/normal/en-US).",
+        help="含 vocab.txt 的目录。默认使用 YAML 中 model.tokenizer.dir。",
     )
     parser.add_argument(
         "--accelerator",
         type=str,
         default="cpu",
         choices=("cpu", "gpu", "cuda", "mps"),
-        help="Lightning accelerator for ModelPT init only (not used for real training here).",
+        help="仅用于构造 ModelPT / Trainer，不参与训练。",
+    )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=("lightning", "weights"),
+        default="lightning",
+        help="lightning: 可 load_from_checkpoint；weights: 纯权重（同 .nemo 内 model_weights.ckpt）。",
+    )
+    parser.add_argument(
+        "--also-model-config",
+        action="store_true",
+        help="额外写出与 .nemo 内相同的 model_config.yaml（与 weights 格式搭配最常用）。",
     )
     args = parser.parse_args()
 
@@ -74,8 +88,7 @@ def main() -> None:
     vocab_txt = tok_dir / "vocab.txt"
     if not vocab_txt.is_file():
         raise FileNotFoundError(
-            f"Expected IPA vocab at {vocab_txt}. "
-            "Set model.tokenizer.dir in the YAML, or pass --tokenizer-dir to the folder that contains vocab.txt."
+            f"未找到 IPA 词表 {vocab_txt}。请在 YAML 中设置 model.tokenizer.dir，或使用 --tokenizer-dir。"
         )
 
     cfg.model.tokenizer.dir = str(tok_dir)
@@ -94,8 +107,24 @@ def main() -> None:
     model = CTCG2PModel(cfg=cfg.model, trainer=trainer)
     out_path = args.out.expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    model.save_to(str(out_path))
-    print(f"Saved randomly initialized model to {out_path}")
+
+    if args.format == "weights":
+        torch.save(model.state_dict(), out_path)
+        print(f"已保存纯权重检查点（state_dict）: {out_path}")
+    else:
+        ckpt = {
+            "state_dict": model.state_dict(),
+            "hyper_parameters": {"cfg": OmegaConf.to_container(model.cfg, resolve=True)},
+            "pytorch-lightning_version": pl.__version__,
+        }
+        torch.save(ckpt, out_path)
+        print(f"已保存 Lightning 检查点: {out_path}")
+        print("加载示例: CTCG2PModel.load_from_checkpoint(r\"...\", map_location=\"cpu\")")
+
+    if args.also_model_config:
+        yaml_path = out_path.with_name("model_config.yaml")
+        model.to_config_file(path2yaml_file=str(yaml_path))
+        print(f"已写出 model_config.yaml: {yaml_path}")
 
 
 if __name__ == "__main__":
