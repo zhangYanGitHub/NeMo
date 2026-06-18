@@ -8,7 +8,7 @@ import os
 import sys
 import unicodedata
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Executor, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Iterator, List, Sequence, Tuple
 
@@ -22,6 +22,7 @@ SECONDARY_STRESS = "\u02cc"  # ˌ
 STRESS = {PRIMARY_STRESS, SECONDARY_STRESS}
 LENGTH = "\u02d0"  # ː
 SPECIAL_TOKENS = ("<pad>", "<unk>")
+MANIFEST_WRITE_BUFFER_LINES = 1024
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,8 +38,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-field", type=str, default="sentence", help="raw text column name")
     parser.add_argument("--lang-field", type=str, default="espeak_lang_code", help="espeak language code column name")
     parser.add_argument("--default-voice", type=str, default="en-us", help="fallback voice when lang field is empty")
-    parser.add_argument("--workers", type=int, default=0, help="thread workers; 0 means os.cpu_count()")
-    parser.add_argument("--batch-size", type=int, default=1024, help="rows per worker batch")
+    parser.add_argument("--workers", type=int, default=0, help="parallel workers; 0 means auto by CPU count")
+    parser.add_argument(
+        "--executor",
+        choices=["thread", "process"],
+        default="process",
+        help="parallel backend; process is usually faster for very large datasets",
+    )
+    parser.add_argument("--batch-size", type=int, default=0, help="rows per worker batch; 0 means auto by CPU count")
     parser.add_argument("--limit", type=int, default=0, help="optional row limit")
     parser.add_argument("--stress", choices=["attach", "separate", "drop"], default="attach")
     parser.add_argument("--manifest-name", type=str, default="train.json")
@@ -180,7 +187,7 @@ def approx_csv_body_line_count(csv_path: Path) -> int:
 
 
 def ordered_process_batches(
-    executor: ThreadPoolExecutor,
+    executor: Executor,
     max_in_flight: int,
     batches_iter: Iterator[List[Tuple[str, str]]],
     default_voice: str,
@@ -256,6 +263,22 @@ def write_vocab(path: Path, tokens: Sequence[str]) -> None:
                 f.write(tok + "\n")
 
 
+def recommend_runtime(cpu_count: int) -> tuple[int, int]:
+    """Return (workers, batch_size) tuned for large CSV preprocessing."""
+    cpu_count = max(1, cpu_count)
+    # Leave a small CPU headroom for OS / IO threads.
+    workers = max(1, cpu_count - 2)
+    workers = min(workers, 24)
+
+    if cpu_count <= 8:
+        batch_size = 2048
+    elif cpu_count <= 16:
+        batch_size = 4096
+    else:
+        batch_size = 8192
+    return workers, batch_size
+
+
 def main() -> None:
     args = parse_args()
     input_csv = args.input_csv.expanduser().resolve()
@@ -267,7 +290,11 @@ def main() -> None:
     grapheme_vocab_path = output_dir / args.grapheme_vocab_name
     merged_vocab_path = output_dir / args.merged_vocab_name
 
-    workers = args.workers or os.cpu_count() or 1
+    cpu_count = os.cpu_count() or 1
+    auto_workers, auto_batch_size = recommend_runtime(cpu_count)
+    workers = args.workers if args.workers > 0 else auto_workers
+    batch_size = args.batch_size if args.batch_size > 0 else auto_batch_size
+    executor_cls = ProcessPoolExecutor if args.executor == "process" else ThreadPoolExecutor
 
     if args.show_progress:
         print("Preprocess: counting newlines in CSV for tqdm total…", file=sys.stderr, flush=True)
@@ -275,21 +302,30 @@ def main() -> None:
             est_rows = args.limit
         else:
             est_rows = approx_csv_body_line_count(input_csv)
-        est_batches = max(1, (est_rows + args.batch_size - 1) // args.batch_size) if est_rows > 0 else None
+        est_batches = max(1, (est_rows + batch_size - 1) // batch_size) if est_rows > 0 else None
     else:
         est_batches = None
 
     phoneme_counter: Counter = Counter()
     grapheme_counter: Counter = Counter()
     processed_rows = 0
+    manifest_buffer: List[str] = []
 
-    batch_iter = iter_batches(iter_csv_rows(input_csv, args.text_field, args.lang_field, args.limit), args.batch_size)
+    def flush_manifest_buffer(manifest_f) -> None:
+        nonlocal manifest_buffer
+        if not manifest_buffer:
+            return
+        manifest_f.write("\n".join(manifest_buffer))
+        manifest_f.write("\n")
+        manifest_buffer = []
+
+    batch_iter = iter_batches(iter_csv_rows(input_csv, args.text_field, args.lang_field, args.limit), batch_size)
 
     with manifest_path.open("w", encoding="utf-8") as manifest_f:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with executor_cls(max_workers=workers) as executor:
             ordered = ordered_process_batches(
                 executor,
-                max(1, workers),
+                max(1, workers * 2),
                 batch_iter,
                 args.default_voice,
                 args.stress,
@@ -310,10 +346,14 @@ def main() -> None:
                 for text, phoneme_text in processed:
                     if not text or not phoneme_text:
                         continue
-                    manifest_f.write(json.dumps({"text_graphemes": text, "text": phoneme_text}, ensure_ascii=False) + "\n")
+                    manifest_buffer.append(json.dumps({"text_graphemes": text, "text": phoneme_text}, ensure_ascii=False))
                     grapheme_counter.update(text)
                     phoneme_counter.update(phoneme_text.split())
                     processed_rows += 1
+                    if len(manifest_buffer) >= MANIFEST_WRITE_BUFFER_LINES:
+                        flush_manifest_buffer(manifest_f)
+
+            flush_manifest_buffer(manifest_f)
 
     if processed_rows == 0:
         raise RuntimeError(f"No valid rows processed from {input_csv}")
@@ -338,7 +378,10 @@ def main() -> None:
 
     print(f"Input CSV: {input_csv}")
     print(f"Processed rows: {processed_rows}")
-    print(f"Workers: {workers}, batch size: {args.batch_size}")
+    print(
+        f"CPU: {cpu_count}, workers: {workers}, executor: {args.executor}, "
+        f"batch size: {batch_size}"
+    )
     print(f"Manifest: {manifest_path}")
     if args.write_vocab:
         print(f"Phoneme vocab: {phoneme_vocab_path}")

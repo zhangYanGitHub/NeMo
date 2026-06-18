@@ -27,6 +27,7 @@
   - `train.json` / `test.json`（由 `--manifest-name` 指定；每行 `text_graphemes` + `text`）
   - `phoneme_vocab.txt`、`grapheme_vocab.txt`
   - `vocab.txt`：音素与字符合集，**G2P 训练时 `model.tokenizer.dir` 指向的目录内需有该文件**
+- 性能默认值已内置按 CPU 自动调优：`workers=max(1, cpu-2)`（上限 24），`batch-size` 随 CPU 自动取 `2048/4096/8192`；直接用下方命令即可，无需再额外传并行参数。
 
 **词表策略：**先跑 **train**，写出全套词表；再跑 **test** 且必须加 `--no-write-vocab`，只生成 `test.json`。若对 test 也开启写词表，会按测试集重新统计并**覆盖** `vocab.txt`，通常不符合预期。
 
