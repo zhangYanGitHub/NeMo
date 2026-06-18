@@ -13,17 +13,15 @@
 新增脚本：`examples/dataset/preprocess_ipa_childes_split.py`
 
 - 只读取 CSV 两列：语言码（默认 `espeak_lang_code`）和原始文本（默认 `sentence`）
-- 不使用 CSV 里的现成 IPA 字段；`text` 始终重新调用 `espeak-ng -v <voice> --ipa=3 -q` 生成
-- 默认按 CPU 核数多线程并发；**需要当前 shell 的 `PATH` 里能直接执行 `espeak-ng`**（与下文 `generate_g2p_manifest_espeak.py` 的 piper 路径不同）。跑预处理前可在**同一终端、同一 conda 环境**里自检：
+- 不使用 CSV 里的现成 IPA 字段；`text` 通过 **`piper-phonemize` 进程内 espeak backend** 重新生成（不再频繁启动 `espeak-ng` 子进程）
+- 默认按 CPU 核数多线程并发；依赖当前 Python 环境里可导入 `piper_phonemize`。可在同一终端、同一 conda 环境里自检：
 
   ```bash
-  command -v espeak-ng
-  espeak-ng --version
-  printf '%s\n' 'hello world' | espeak-ng -v en-us --ipa=3 -q
+  python -c "import piper_phonemize; print('ok')"
   ```
 
-  第一行应打印绝对路径；第三行应输出一行 IPA。若第一行为空，说明该环境里找不到 `espeak-ng`，需先安装或把含 `espeak-ng` 的目录加入 `PATH`（例如 `conda install -c conda-forge espeak-ng` 后再试）。
-- 默认开启 **`tqdm` 进度条**（`--no-show-progress` 可关）。若使用 `2>&1 | tee` 等非 TTY 重定向，脚本仍会输出进度条；**第一个 batch**（默认 1024 行）要等本批 `espeak-ng` 跑完才会从 `0batch` 涨到 `1batch`，全表很大时开头会卡住较久，可把 **`--batch-size`** 调小（例如 `128`）让刷新更频繁（总开销可能略增）。
+  若导入失败，先安装依赖：`pip install -r examples/dataset/requirements.txt`
+- 默认开启 **`tqdm` 进度条**（`--no-show-progress` 可关）；进度输出在 **stderr**，且 **`disable=False`**，即使用 `2>&1 | tee` 也会写入日志。实现上采用**有上限的并发提交 + 保序回收**，避免旧版 `executor.map` 先读完整个 CSV 再等工作、导致长时间停在 `0batch` 的问题。全表很大时开头仍会先扫一遍 CSV 统计换行（用于 `total`），终端会先出现一行 `Preprocess: counting newlines…`。
 - 输出 manifest 里 `text` 为**空格分隔的 IPA 单元**（与 `examples/tts/g2p/conf/g2p_conformer_ctc.yaml` 中的 `ipa_symbol` tokenizer 一致）
 - 输出文件（均在 `--output-dir` 下）：
   - `train.json` / `test.json`（由 `--manifest-name` 指定；每行 `text_graphemes` + `text`）
