@@ -8,78 +8,84 @@
 下载 CSV 原始数据  →  批量 G2P 音素化  →  train.json + vocab.txt
 ```
 
-## 推荐流程（ipa-childes-split -> normal/en-US）
+## 推荐流程（ipa-childes-split → `dataset/release/en-US`，Conformer-CTC）
 
 新增脚本：`examples/dataset/preprocess_ipa_childes_split.py`
 
 - 只读取 CSV 两列：语言码（默认 `espeak_lang_code`）和原始文本（默认 `sentence`）
 - 不使用 CSV 里的现成 IPA 字段；`text` 始终重新调用 `espeak-ng -v <voice> --ipa=3 -q` 生成
-- 默认按 CPU 核数多线程并发
-- 输出：
-  - `train.json`（`text_graphemes` + `text`）
-  - `phoneme_vocab.txt`（音素 token 词表）
-  - `grapheme_vocab.txt`（原始文本字符词表）
-  - `vocab.txt`（两者合集，训练可直接用）
+- 默认按 CPU 核数多线程并发；**需要当前 shell 的 `PATH` 里能直接执行 `espeak-ng`**（与下文 `generate_g2p_manifest_espeak.py` 的 piper 路径不同）。跑预处理前可在**同一终端、同一 conda 环境**里自检：
 
-预处理命令（en-US）：
+  ```bash
+  command -v espeak-ng
+  espeak-ng --version
+  printf '%s\n' 'hello world' | espeak-ng -v en-us --ipa=3 -q
+  ```
+
+  第一行应打印绝对路径；第三行应输出一行 IPA。若第一行为空，说明该环境里找不到 `espeak-ng`，需先安装或把含 `espeak-ng` 的目录加入 `PATH`（例如 `conda install -c conda-forge espeak-ng` 后再试）。
+- 默认开启 **`tqdm` 进度条**（`--no-show-progress` 可关）。若使用 `2>&1 | tee` 等非 TTY 重定向，脚本仍会输出进度条；**第一个 batch**（默认 1024 行）要等本批 `espeak-ng` 跑完才会从 `0batch` 涨到 `1batch`，全表很大时开头会卡住较久，可把 **`--batch-size`** 调小（例如 `128`）让刷新更频繁（总开销可能略增）。
+- 输出 manifest 里 `text` 为**空格分隔的 IPA 单元**（与 `examples/tts/g2p/conf/g2p_conformer_ctc.yaml` 中的 `ipa_symbol` tokenizer 一致）
+- 输出文件（均在 `--output-dir` 下）：
+  - `train.json` / `test.json`（由 `--manifest-name` 指定；每行 `text_graphemes` + `text`）
+  - `phoneme_vocab.txt`、`grapheme_vocab.txt`
+  - `vocab.txt`：音素与字符合集，**G2P 训练时 `model.tokenizer.dir` 指向的目录内需有该文件**
+
+**词表策略：**先跑 **train**，写出全套词表；再跑 **test** 且必须加 `--no-write-vocab`，只生成 `test.json`。若对 test 也开启写词表，会按测试集重新统计并**覆盖** `vocab.txt`，通常不符合预期。
+
+预处理命令（仓库根目录执行；en-US 相对路径示例如下。若在其它机器上，把 CSV / `--output-dir` 换成你的绝对路径即可，例如输入 `/path/to/NeMo/dataset/ipa-childes-split/.../data.csv`，输出 `/path/to/NeMo/dataset/release/en-US`）：
 
 ```bash
-# train
+# 1) train：生成 train.json + vocab.txt（及 phoneme / grapheme 词表）
 python examples/dataset/preprocess_ipa_childes_split.py \
   --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
-  --output-dir dataset/normal/en-US
+  --output-dir dataset/release/en-US \
+  --manifest-name train.json \
+  --merged-vocab-name vocab.txt \
+  --phoneme-vocab-name phoneme_vocab.txt \
+  --grapheme-vocab-name grapheme_vocab.txt
 
-# test（仅覆盖 manifest，vocab 会按 test 重新统计；若你希望 vocab 仅来自 train，请去掉这一步）
+# 2) test：只生成 test.json，不覆盖 train 统计的词表
 python examples/dataset/preprocess_ipa_childes_split.py \
   --input-csv dataset/ipa-childes-split/test/en-US/data.csv \
-  --output-dir dataset/normal/en-US \
+  --output-dir dataset/release/en-US \
   --manifest-name test.json \
   --no-write-vocab
 ```
 
-训练命令（与你现有机器命令对齐，路径切到 `dataset/normal/en-US`）：
+可选：若下游需要 JSON 形式的音素表（例如与 `IPASymbolTokenizer.from_meta` 的 `phoneme_labels` 对齐），或复制字素词表为 `vocab_origin.txt`，在仓库根目录执行：
 
 ```bash
+cd dataset/release/en-US
+
+python3 -c "import json; p='phoneme_vocab.txt'; labels=[l.rstrip('\n') for l in open(p,encoding='utf-8') if l.strip()]; print(json.dumps({'phoneme_labels': labels}, ensure_ascii=False, indent=2))" > vocab_phoneme.json
+
+# 若需单独保留「字素侧」词表副本（命名自定）
+cp grapheme_vocab.txt vocab_origin.txt
+```
+
+训练命令：**模型与优化器、trainer、`exp_manager` 等均采用** `examples/tts/g2p/conf/g2p_conformer_ctc.yaml` **默认值**；命令行只覆盖数据路径、tokenizer 目录与实验输出目录。请在仓库根目录执行：
+
+```bash
+mkdir -p logs exp
+
 python3 examples/tts/g2p/g2p_train_and_evaluate.py \
   --config-name=g2p_conformer_ctc \
-  model.train_ds.manifest_filepath=$PWD/dataset/normal/en-US/train.json \
-  model.validation_ds.manifest_filepath=$PWD/dataset/normal/en-US/train.json \
-  model.test_ds.manifest_filepath=$PWD/dataset/normal/en-US/test.json \
-  model.tokenizer.dir=$PWD/dataset/normal/en-US \
-  model.tokenizer_grapheme.do_lower=true \
-  model.tokenizer_grapheme.add_punctuation=false \
-  model.embedding.d_model=512 \
-  model.encoder.d_model=512 \
-  model.encoder.n_layers=12 \
-  model.encoder.n_heads=8 \
-  model.encoder.conv_kernel_size=31 \
-  model.encoder.pos_emb_max_len=1024 \
-  model.train_ds.dataloader_params.batch_size=32 \
-  model.validation_ds.dataloader_params.batch_size=32 \
-  model.test_ds.dataloader_params.batch_size=32 \
-  model.train_ds.dataloader_params.num_workers=8 \
-  model.validation_ds.dataloader_params.num_workers=4 \
-  model.test_ds.dataloader_params.num_workers=2 \
-  +optim.lr=1.0 \
-  +sched.warmup_steps=8000 \
-  trainer.devices=1 \
-  trainer.accelerator=gpu \
-  trainer.precision=16 \
-  trainer.max_epochs=400 \
-  trainer.log_every_n_steps=50 \
-  trainer.enable_checkpointing=false \
-  exp_manager.exp_dir=$PWD/exp/g2p_en_us_260w \
-  exp_manager.name=conformer_ctc_en_us_260w \
-  exp_manager.create_tensorboard_logger=true \
-  exp_manager.create_checkpoint_callback=true \
-  exp_manager.checkpoint_callback_params.monitor=val_per \
-  exp_manager.checkpoint_callback_params.mode=min \
-  exp_manager.checkpoint_callback_params.save_top_k=-1 \
-  +exp_manager.checkpoint_callback_params.every_n_epochs=1 \
+  train_manifest=$PWD/dataset/release/en-US/train.json \
+  validation_manifest=$PWD/dataset/release/en-US/train.json \
+  test_manifest=$PWD/dataset/release/en-US/test.json \
+  model.tokenizer.dir=$PWD/dataset/release/en-US \
+  exp_manager.exp_dir=$PWD/exp/g2p_conformer_ctc_en_us_release \
   do_training=true \
   do_testing=true \
-  2>&1 | tee $PWD/logs/g2p_conformer_en_us_260w_30epoch_$(date +%F_%H-%M-%S).log
+  2>&1 | tee "$PWD/logs/g2p_conformer_ctc_en_us_release_$(date +%F_%H-%M-%S).log"
 ```
+
+说明：
+
+- 配置见 `examples/tts/g2p/conf/g2p_conformer_ctc.yaml`（含 `model.tokenizer_grapheme`、`model.encoder`、`optim` / `sched`、`trainer`、`exp_manager` 等）；**无需**在命令行重复 `model.embedding.d_model`、`+optim.lr` 等与 YAML 相同的项。
+- `validation_manifest` 与 `train_manifest` 指向同一文件与 YAML 默认用法一致；若你有单独验证集，改为对应 `val.json` 路径即可。
+- `exp_manager.exp_dir` 在 YAML 中为 `null`，训练时必须通过命令行设为可写目录（上例为 `$PWD/exp/g2p_conformer_ctc_en_us_release`）。
+- 导出 `.ckpt` / `.nemo` 后，下文「G2P 训练 checkpoint 与 manifest 后处理」中的路径请按你的 `exp_manager.exp_dir` 与实际 run 目录替换。
 
 ---
 
@@ -375,13 +381,17 @@ python examples/dataset/generate_g2p_manifest_espeak.py \
 字段说明：
 
 - `text_graphemes`：输入 grapheme 文本
-- `text`：espeak-ng 生成的 IPA 音素串
+- `text`：espeak-ng 生成的 IPA；**`generate_g2p_manifest_espeak.py` 常为连续 IPA 字符串**；**`preprocess_ipa_childes_split.py` 则为空格分隔的 IPA 单元**（与 `examples/tts/g2p/conf/g2p_conformer_ctc.yaml` 中的 `ipa_symbol` tokenizer 一致）
 
-可直接用于 NeMo G2P 训练配置（如 `examples/tts/g2p/conf/g2p_t5.yaml`）中的 `train_manifest`。
+可直接用于 NeMo G2P 的 `train_manifest` 等（例如 T5 用 `examples/tts/g2p/conf/g2p_t5.yaml`，Conformer-CTC 用 `examples/tts/g2p/conf/g2p_conformer_ctc.yaml`）。
 
 ### vocab.txt
 
-从 manifest 每条记录的 **`text_graphemes`** 和 **`text`** 两个字段收集**全部**出现过的字符，写入 `--output-vocab`。
+对 **`generate_g2p_manifest_espeak.py`**：`--output-vocab` 从 manifest 每条记录的 **`text_graphemes`** 与 **`text`** 收集全部出现过的字符。
+
+若使用 **`preprocess_ipa_childes_split.py`**，词表由脚本单独统计并写出，格式见上文「推荐流程」：`vocab.txt` 为音素单元与字符合集，行首为 `<pad>` / `<unk>`，**不含**下文示例中的 `<bos>` / `<eos>` 固定行。
+
+下文「固定头部 + 字符表」示意仅针对 **`generate_g2p_manifest_espeak.py`** 产物：
 
 文件格式（固定头部 + 数据里出现过的 IPA 字符）：
 

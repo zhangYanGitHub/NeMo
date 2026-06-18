@@ -184,6 +184,16 @@ def iter_batches(rows: Iterator[Tuple[str, str]], batch_size: int) -> Iterator[L
         yield batch
 
 
+def approx_csv_body_line_count(csv_path: Path) -> int:
+    """Fast (data lines ≈ newlines − header) for tqdm total; assumes no multiline CSV fields."""
+    try:
+        with csv_path.open("rb") as f:
+            n_newlines = sum(chunk.count(b"\n") for chunk in iter(lambda: f.read(1024 * 1024), b""))
+    except OSError:
+        return 0
+    return max(0, n_newlines - 1)
+
+
 def process_batch(
     batch_rows: Sequence[Tuple[str, str]],
     default_voice: str,
@@ -231,6 +241,15 @@ def main() -> None:
     workers = args.workers or os.cpu_count() or 1
     batches = iter_batches(iter_csv_rows(input_csv, args.text_field, args.lang_field, args.limit), args.batch_size)
 
+    if args.show_progress:
+        if args.limit > 0:
+            est_rows = args.limit
+        else:
+            est_rows = approx_csv_body_line_count(input_csv)
+        est_batches = max(1, (est_rows + args.batch_size - 1) // args.batch_size) if est_rows > 0 else None
+    else:
+        est_batches = None
+
     phoneme_counter: Counter = Counter()
     grapheme_counter: Counter = Counter()
     processed_rows = 0
@@ -244,7 +263,15 @@ def main() -> None:
                 itertools.repeat(args.stress),
             )
             if args.show_progress:
-                mapped = tqdm(mapped, desc="Preprocess", unit="batch", dynamic_ncols=True)
+                mapped = tqdm(
+                    mapped,
+                    desc="Preprocess",
+                    unit="batch",
+                    total=est_batches,
+                    dynamic_ncols=True,
+                    mininterval=0.5,
+                    disable=False,
+                )
 
             for processed in mapped:
                 for text, phoneme_text in processed:
