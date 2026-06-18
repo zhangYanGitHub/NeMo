@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""随机初始化 CTC Conformer G2P：只生成 **一个目录** 内的 ``model.ckpt`` 与配套 **JSON**（不经训练、不导出 ONNX）。
+"""随机初始化 Conformer-CTC G2P：仅在 ``--out-dir`` 生成 ``model.ckpt`` + ``model.json``。
 
-- ``lightning``（默认）：Lightning 检查点，可用 ``CTCG2PModel.load_from_checkpoint(目录/model.ckpt)``。
-- ``weights``：纯 ``state_dict``（与 .nemo 内 ``model_weights.ckpt`` 同类）。
+与训练仓库中 ``export_nemo_g2p_ctc_onnx.py`` / ``g2p_nemo_client.py`` 对齐的要点：
 
-``--out-dir`` 下默认生成：
+- **model.ckpt**（默认 ``lightning``）：``hyper_parameters.cfg`` 存 **DictConfig**（不用纯 dict），
+  以便 ``CTCG2PModel.load_from_checkpoint(path)`` 在反序列化后仍得到 ``cfg.model_name`` 等属性访问。
+- **model.json**：含 ``model_config``、``inference``、``io_shapes``，以及 **onnx_runtime_meta** ——
+  字段与导出脚本写入的 ``*.g2p_export_meta.json`` 一致（供与 ``g2p_nemo_client.load_g2p_export_meta`` 对照；ONNX 仍须用 export 脚本生成 sidecar）。
 
-- ``model.ckpt``
-- ``model_config.json``：解析后的 ``model.cfg``
-- ``inference.json``：音素/字素表、blank 下标、``max_source_len``、IPA ``vocab.txt`` 路径等
-- ``io_shapes.json``：``forward_for_export`` 的输入输出名字与 ``dynamic_axes``（给部署侧对齐 I/O 维度假设）
+``--format weights``：仅 ``state_dict``；此时须用 ``model.json`` 的 ``model_config`` 自行 ``OmegaConf.create`` + ``CTCG2PModel`` + ``load_state_dict``。
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import lightning.pytorch as pl
 import torch
@@ -40,7 +39,6 @@ from nemo.collections.tts.g2p.models.ctc import CTCG2PModel
 
 
 def _to_jsonable(obj: Any) -> Any:
-    """将 OmegaConf / 容器递归转为可 ``json.dump`` 的结构。"""
     if isinstance(obj, DictConfig):
         return {k: _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, ListConfig):
@@ -60,47 +58,160 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
-def _grapheme_labels_in_id_order(model: CTCG2PModel) -> list[str]:
-    g = model.tokenizer_grapheme
-    inv = getattr(g, "inv_vocab", None)
-    if not inv:
+def _grapheme_vocab_ordered(model: CTCG2PModel) -> List[str]:
+    """与 export_nemo_g2p_ctc_onnx._grapheme_vocab_ordered 一致。"""
+    tg = model.tokenizer_grapheme
+    n = int(getattr(tg, "vocab_size", 0))
+    if n <= 0:
         return []
-    n = getattr(g, "vocab_size", len(inv))
-    out: list[str] = []
+    out: List[str] = []
     for i in range(n):
-        tok = inv.get(i)
-        if tok is None:
-            out.append("")
+        if hasattr(tg, "ids_to_tokens"):
+            tks = tg.ids_to_tokens([i])
+            out.append(tks[0] if tks else "")
         else:
-            out.append(tok if isinstance(tok, str) else str(tok))
+            out.append("")
     return out
 
 
-def _write_json_bundle(model: CTCG2PModel, ipa_vocab_path: Path, out_dir: Path, ckpt_path: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _grapheme_unk_id_optional(model: CTCG2PModel) -> Optional[int]:
+    tg = model.tokenizer_grapheme
+    try:
+        return int(tg.unk_id)
+    except Exception:
+        return None
 
-    _write_json(out_dir / "model_config.json", _to_jsonable(model.cfg))
 
+def _ipa_tokenizer_special_strings(model: CTCG2PModel) -> List[str]:
+    tok = getattr(model, "tokenizer", None)
+    inner = getattr(tok, "tokenizer", None) if tok is not None else None
+    if inner is None:
+        return []
+    sp = getattr(inner, "all_special_tokens", None)
+    if isinstance(sp, (list, tuple)) and sp:
+        return [str(x) for x in sp if x is not None]
+    out: List[str] = []
+    for name in ("pad_token", "unk_token", "blank_token"):
+        t = getattr(inner, name, None)
+        if t is not None:
+            out.append(str(t))
+    return out
+
+
+def _ctc_supported_punctuation_sorted(model: CTCG2PModel) -> List[str]:
+    dec = getattr(model, "decoding", None)
+    if dec is None:
+        return []
+    sp = getattr(dec, "supported_punctuation", None)
+    if not sp:
+        return []
+    return sorted(str(x) for x in sp)
+
+
+def _resolve_blank_id(model: CTCG2PModel) -> tuple[int, str]:
+    if hasattr(model, "decoding") and hasattr(model.decoding, "blank_id"):
+        return int(model.decoding.blank_id), "model.decoding.blank_id"
+    tok = getattr(model, "tokenizer", None)
+    inner = getattr(tok, "tokenizer", None) if tok is not None else None
+    vs = getattr(inner, "vocab_size", None) if inner is not None else None
+    if vs is not None:
+        return int(vs), "model.tokenizer.tokenizer.vocab_size"
+    n = len(getattr(model, "vocabulary", []))
+    return n, "fallback len(model.vocabulary)"
+
+
+def _resolve_num_classes(model: CTCG2PModel) -> tuple[int, str]:
+    dec = getattr(model, "decoder", None)
+    if dec is not None and hasattr(dec, "num_classes_with_blank"):
+        return int(dec.num_classes_with_blank), "model.decoder.num_classes_with_blank"
+    return -1, "unknown"
+
+
+def _log_probs_layout_note(model: CTCG2PModel, device: torch.device) -> str:
+    model.eval()
+    T = min(8, int(getattr(model, "max_source_len", model.cfg.get("max_source_len", 128))))
+    vocab = int(model.tokenizer_grapheme.vocab_size)
+    ids = torch.randint(1, max(2, vocab), (1, T), device=device, dtype=torch.long)
+    lens = torch.tensor([T], device=device, dtype=torch.long)
+    with torch.inference_mode():
+        lp, el = model.forward_for_export(ids, lens)
+    return (
+        f"log_probs_shape_example={tuple(lp.shape)}; encoded_len_shape_example={tuple(el.shape)}; "
+        "通常 log_probs 为 [B, T_enc, num_classes_with_blank]（以实测为准）"
+    )
+
+
+def _build_onnx_runtime_meta(model: CTCG2PModel, device: torch.device) -> Dict[str, Any]:
+    """
+    与 export_nemo_g2p_ctc_onnx.write_sidecar_metadata 写入的 dict 对齐（除 fixed_batch/opset 等导出后才有的项）。
+    g2p_nemo_client.load_g2p_export_meta 要求 phoneme_labels / blank_index / max_source_len / grapheme_vocab。
+    """
+    blank_id, blank_src = _resolve_blank_id(model)
+    ncls, ncls_src = _resolve_num_classes(model)
+    layout = _log_probs_layout_note(model, device)
+    do_lower = bool(model.cfg.tokenizer_grapheme.get("do_lower", True))
+    add_punct = bool(model.cfg.tokenizer_grapheme.get("add_punctuation", False))
+    try:
+        import nemo
+
+        nemo_ver = getattr(nemo, "__version__", "unknown")
+    except Exception:
+        nemo_ver = "unknown"
+
+    return {
+        "phoneme_labels": list(model.vocabulary),
+        "phoneme_label_count": len(model.vocabulary),
+        "blank_index": blank_id,
+        "blank_index_how_determined": blank_src,
+        "blank_handling_note": (
+            "CTC blank 与真实 token 列对齐：logits 最后一维为 num_classes_with_blank；"
+            "NeMo CTCBPEDecoding 使用 blank_id = tokenizer.tokenizer.vocab_size（通常等于 len(phoneme_labels)）。"
+            "解码前对每帧 argmax，再按 CTC 规则去 blank、合并连续重复 token。"
+        ),
+        "max_source_len": int(model._cfg.get("max_source_len", model.max_source_len)),
+        "tokenizer_grapheme_do_lower": do_lower,
+        "tokenizer_grapheme_add_punctuation": add_punct,
+        "grapheme_vocab": _grapheme_vocab_ordered(model),
+        "grapheme_unk_id": _grapheme_unk_id_optional(model),
+        "tokenizer_special_tokens": _ipa_tokenizer_special_strings(model),
+        "ctc_supported_punctuation": _ctc_supported_punctuation_sorted(model),
+        "model_mode": str(getattr(model, "mode", "")),
+        "model_cfg_model_name": str(model.cfg.get("model_name", "")),
+        "fixed_batch": None,
+        "fixed_seq_len": None,
+        "opset_version": None,
+        "export_backend": "not_exported_yet_random_init_bundle",
+        "num_classes_with_blank": ncls,
+        "num_classes_with_blank_how_determined": ncls_src,
+        "log_probs_layout_note": layout,
+        "onnx_expected_input_names": ["input_ids", "input_len"],
+        "onnx_expected_output_names": ["log_probs", "encoded_len"],
+        "pytorch_versions": {"torch": torch.__version__, "nemo_toolkit": nemo_ver},
+    }
+
+
+def _build_model_json(
+    model: CTCG2PModel,
+    ipa_vocab_path: Path,
+    ckpt_name: str,
+    device: torch.device,
+) -> Dict[str, Any]:
     nwb = model.decoder.num_classes_with_blank
     phoneme_labels = [str(t) for t in list(model.vocabulary)]
     blank_class_index = nwb - 1
 
-    _write_json(
-        out_dir / "inference.json",
-        {
-            "schema_version": 1,
-            "checkpoint_file": ckpt_path.name,
-            "model_target": getattr(model.cfg, "target", None),
-            "max_source_len": int(model._cfg.get("max_source_len", model.max_source_len)),
-            "tokenizer_grapheme_do_lower": bool(model._cfg.tokenizer_grapheme.get("do_lower", True)),
-            "ipa_vocab_path": str(ipa_vocab_path.resolve()),
-            "phoneme_labels": phoneme_labels,
-            "decoder_num_classes_with_blank": int(nwb),
-            "ctc_blank_class_index": int(blank_class_index),
-            "note": "log_probs 最后一维下标 ctc_blank_class_index 为 CTC blank；0..len(phoneme_labels)-1 与 phoneme_labels 对齐。",
-            "grapheme_labels_by_id": _grapheme_labels_in_id_order(model),
-        },
-    )
+    inference = {
+        "checkpoint_file": ckpt_name,
+        "model_target": getattr(model.cfg, "target", None),
+        "max_source_len": int(model._cfg.get("max_source_len", model.max_source_len)),
+        "tokenizer_grapheme_do_lower": bool(model._cfg.tokenizer_grapheme.get("do_lower", True)),
+        "ipa_vocab_path": str(ipa_vocab_path.resolve()),
+        "phoneme_labels": phoneme_labels,
+        "decoder_num_classes_with_blank": int(nwb),
+        "ctc_blank_class_index": int(blank_class_index),
+        "note": "log_probs 最后一维 ctc_blank_class_index 为 CTC blank 列下标。",
+        "grapheme_vocab_ordered": _grapheme_vocab_ordered(model),
+    }
 
     model._prepare_for_export()
     try:
@@ -114,18 +225,21 @@ def _write_json_bundle(model: CTCG2PModel, ipa_vocab_path: Path, out_dir: Path, 
     finally:
         model._export_teardown()
 
-    _write_json(
-        out_dir / "io_shapes.json",
-        {
-            "schema_version": 1,
-            "forward_for_export": "forward_for_export(input_ids, input_len) -> (log_probs, encoded_len)",
-            "input_names": in_names,
-            "output_names": out_names,
-            "dynamic_axes": dyn_plain,
-        },
-    )
+    io_shapes = {
+        "forward_for_export": "forward_for_export(input_ids, input_len) -> (log_probs, encoded_len)",
+        "input_names": in_names,
+        "output_names": out_names,
+        "dynamic_axes": dyn_plain,
+    }
 
-    print(f"已写出目录 {out_dir}：{ckpt_path.name}, model_config.json, inference.json, io_shapes.json")
+    return {
+        "schema_version": 3,
+        "checkpoint_file": ckpt_name,
+        "model_config": _to_jsonable(model.cfg),
+        "inference": inference,
+        "io_shapes": io_shapes,
+        "onnx_runtime_meta": _build_onnx_runtime_meta(model, device),
+    }
 
 
 def main() -> None:
@@ -135,49 +249,44 @@ def main() -> None:
         "--out-dir",
         type=Path,
         default=Path("g2p_random_init_bundle"),
-        help="输出目录（将创建）；内含 model.ckpt 与若干 JSON。",
+        help="输出目录：model.ckpt + model.json",
     )
     parser.add_argument(
         "--ckpt-name",
         type=str,
         default="model.ckpt",
-        help="写在 out-dir 下的 ckpt 文件名。",
+        help="ckpt 文件名",
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=default_conf,
-        help="完整 YAML（与训练配置同一套键）。",
+        help="Hydra 风格完整 YAML",
     )
     parser.add_argument(
         "--tokenizer-dir",
         type=Path,
         default=None,
-        help="含 vocab.txt 的目录。默认使用 YAML 中 model.tokenizer.dir。",
+        help="含 vocab.txt；默认 YAML model.tokenizer.dir",
     )
     parser.add_argument(
         "--accelerator",
         type=str,
         default="cpu",
         choices=("cpu", "gpu", "cuda", "mps"),
-        help="仅用于构造 ModelPT / Trainer，不参与训练。",
+        help="仅构建 Trainer 用",
     )
     parser.add_argument(
         "--format",
         type=str,
         choices=("lightning", "weights"),
         default="lightning",
-        help="lightning: 可 load_from_checkpoint；weights: 纯 state_dict。",
-    )
-    parser.add_argument(
-        "--also-model-config",
-        action="store_true",
-        help="在同一目录额外写出 model_config.yaml。",
+        help="lightning: 供 load_from_checkpoint（cfg 存 DictConfig）；weights: 仅 state_dict",
     )
     parser.add_argument(
         "--no-json",
         action="store_true",
-        help="只写 ckpt，不写 JSON。",
+        help="只写 ckpt",
     )
     args = parser.parse_args()
 
@@ -200,7 +309,7 @@ def main() -> None:
     vocab_txt = tok_dir / "vocab.txt"
     if not vocab_txt.is_file():
         raise FileNotFoundError(
-            f"未找到 IPA 词表 {vocab_txt}。请在 YAML 中设置 model.tokenizer.dir，或使用 --tokenizer-dir。"
+            f"未找到 IPA 词表 {vocab_txt}。请设置 model.tokenizer.dir 或 --tokenizer-dir。"
         )
 
     cfg.model.tokenizer.dir = str(tok_dir)
@@ -217,6 +326,13 @@ def main() -> None:
         enable_model_summary=False,
     )
     model = CTCG2PModel(cfg=cfg.model, trainer=trainer)
+    if accel == "mps":
+        model.to("mps")
+    elif accel == "gpu":
+        model.to(torch.device("cuda", 0))
+    else:
+        model.to("cpu")
+    dev = next(model.parameters()).device
 
     if args.format == "weights":
         torch.save(model.state_dict(), ckpt_path)
@@ -224,21 +340,18 @@ def main() -> None:
     else:
         ckpt = {
             "state_dict": model.state_dict(),
-            "hyper_parameters": {"cfg": OmegaConf.to_container(model.cfg, resolve=True)},
+            "hyper_parameters": {"cfg": model.cfg},
             "pytorch-lightning_version": pl.__version__,
         }
         torch.save(ckpt, ckpt_path)
-        print(f"已保存 Lightning 检查点: {ckpt_path}")
+        print(f"已保存 Lightning ckpt（cfg 为 DictConfig）: {ckpt_path}")
 
     if not args.no_json:
-        _write_json_bundle(model, vocab_txt, out_dir, ckpt_path)
+        payload = _build_model_json(model, vocab_txt, ckpt_path.name, dev)
+        _write_json(out_dir / "model.json", payload)
+        print(f"已写出: {out_dir / 'model.json'}（含 onnx_runtime_meta，便于对照 g2p_nemo_client / export sidecar）")
     else:
         print(f"输出目录: {out_dir}")
-
-    if args.also_model_config:
-        yaml_path = out_dir / "model_config.yaml"
-        model.to_config_file(path2yaml_file=str(yaml_path))
-        print(f"已写出 model_config.yaml: {yaml_path}")
 
 
 if __name__ == "__main__":
