@@ -8,6 +8,79 @@
 下载 CSV 原始数据  →  批量 G2P 音素化  →  train.json + vocab.txt
 ```
 
+## 推荐流程（ipa-childes-split -> normal/en-US）
+
+新增脚本：`examples/dataset/preprocess_ipa_childes_split.py`
+
+- 只读取 CSV 两列：语言码（默认 `espeak_lang_code`）和原始文本（默认 `sentence`）
+- 不使用 CSV 里的现成 IPA 字段；`text` 始终重新调用 `espeak-ng -v <voice> --ipa=3 -q` 生成
+- 默认按 CPU 核数多线程并发
+- 输出：
+  - `train.json`（`text_graphemes` + `text`）
+  - `phoneme_vocab.txt`（音素 token 词表）
+  - `grapheme_vocab.txt`（原始文本字符词表）
+  - `vocab.txt`（两者合集，训练可直接用）
+
+预处理命令（en-US）：
+
+```bash
+# train
+python examples/dataset/preprocess_ipa_childes_split.py \
+  --input-csv dataset/ipa-childes-split/train/en-US/data.csv \
+  --output-dir dataset/normal/en-US
+
+# test（仅覆盖 manifest，vocab 会按 test 重新统计；若你希望 vocab 仅来自 train，请去掉这一步）
+python examples/dataset/preprocess_ipa_childes_split.py \
+  --input-csv dataset/ipa-childes-split/test/en-US/data.csv \
+  --output-dir dataset/normal/en-US \
+  --manifest-name test.json \
+  --no-write-vocab
+```
+
+训练命令（与你现有机器命令对齐，路径切到 `dataset/normal/en-US`）：
+
+```bash
+python3 examples/tts/g2p/g2p_train_and_evaluate.py \
+  --config-name=g2p_conformer_ctc \
+  model.train_ds.manifest_filepath=$PWD/dataset/normal/en-US/train.json \
+  model.validation_ds.manifest_filepath=$PWD/dataset/normal/en-US/train.json \
+  model.test_ds.manifest_filepath=$PWD/dataset/normal/en-US/test.json \
+  model.tokenizer.dir=$PWD/dataset/normal/en-US \
+  model.tokenizer_grapheme.do_lower=true \
+  model.tokenizer_grapheme.add_punctuation=false \
+  model.embedding.d_model=512 \
+  model.encoder.d_model=512 \
+  model.encoder.n_layers=12 \
+  model.encoder.n_heads=8 \
+  model.encoder.conv_kernel_size=31 \
+  model.encoder.pos_emb_max_len=1024 \
+  model.train_ds.dataloader_params.batch_size=32 \
+  model.validation_ds.dataloader_params.batch_size=32 \
+  model.test_ds.dataloader_params.batch_size=32 \
+  model.train_ds.dataloader_params.num_workers=8 \
+  model.validation_ds.dataloader_params.num_workers=4 \
+  model.test_ds.dataloader_params.num_workers=2 \
+  +optim.lr=1.0 \
+  +sched.warmup_steps=8000 \
+  trainer.devices=1 \
+  trainer.accelerator=gpu \
+  trainer.precision=16 \
+  trainer.max_epochs=400 \
+  trainer.log_every_n_steps=50 \
+  trainer.enable_checkpointing=false \
+  exp_manager.exp_dir=$PWD/exp/g2p_en_us_260w \
+  exp_manager.name=conformer_ctc_en_us_260w \
+  exp_manager.create_tensorboard_logger=true \
+  exp_manager.create_checkpoint_callback=true \
+  exp_manager.checkpoint_callback_params.monitor=val_per \
+  exp_manager.checkpoint_callback_params.mode=min \
+  exp_manager.checkpoint_callback_params.save_top_k=-1 \
+  +exp_manager.checkpoint_callback_params.every_n_epochs=1 \
+  do_training=true \
+  do_testing=true \
+  2>&1 | tee $PWD/logs/g2p_conformer_en_us_260w_30epoch_$(date +%F_%H-%M-%S).log
+```
+
 ---
 
 ## 环境准备

@@ -1,5 +1,5 @@
-# 端侧最小 Conformer-CTC G2P：用于替换 espeak-ng 路线上的体积/时延基线（需自行训练后才有正确读音）。
-# 随机初始化 .ckpt：python examples/tts/g2p/g2p_save_random_init_ckpt.py（见该脚本 --help）。
+# 标准容量 Conformer-CTC G2P：优先验证准确率，再根据结果回退到更小模型。
+# 替换 espeak-ng G2P 时，建议先用该配置拿到稳定 PER，再逐步裁剪层数/宽度做端侧折中。
 name: G2P-Conformer-CTC
 
 # 训练时改为你的 jsonl manifest；仅导出随机 ckpt 时可保持 null
@@ -7,13 +7,13 @@ train_manifest: null
 validation_manifest: null
 test_manifest: null
 do_training: True
-do_testing: False
+do_testing: True
 pretrained_model: null # path to .nemo file or model name from list_available_models()
 
 model:
   model_name: conformer_bpe
-  # 单词级 G2P 一般远小于 128；可按最长词再调大
-  max_source_len: 64
+  # 先留足长度，减少长词/短句被截断带来的准确率损失
+  max_source_len: 128
 
   tokenizer_grapheme:
     dataset:
@@ -24,36 +24,37 @@ model:
     add_punctuation: false
 
   embedding:
-    d_model: 128
+    d_model: 512
 
   encoder:
     _target_: nemo.collections.asr.modules.ConformerEncoder
     feat_in: ${model.embedding.d_model}
     feat_out: -1
-    n_layers: 4
-    d_model: 128
+    n_layers: 12
+    d_model: 512
 
-    # 下采样缩短时间维，利于端上时延（短序列也通常略快）
+    # 先保持与你现有训练命令一致，优先验证准确性
     subsampling: striding
     subsampling_factor: 2
     subsampling_conv_channels: -1
 
-    ff_expansion_factor: 2
+    ff_expansion_factor: 4
 
     self_attention_model: rel_pos
-    n_heads: 4
+    n_heads: 8
     att_context_size: [ -1, -1 ]
     xscaling: true
     untie_biases: true
-    pos_emb_max_len: 256
+    pos_emb_max_len: 1024
 
-    conv_kernel_size: 15
+    conv_kernel_size: 31
     conv_norm_type: layer_norm
 
-    dropout: 0.0
-    dropout_pre_encoder: 0.0
-    dropout_emb: 0.0
-    dropout_att: 0.0
+    # 从“先过拟合”转为“可泛化”的默认正则强度
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.1
+    dropout_att: 0.1
 
   decoder:
     _target_: nemo.collections.asr.modules.ConvASRDecoder
@@ -62,8 +63,8 @@ model:
     vocabulary: null
 
   tokenizer:
-    # ipa_symbol：目录内需有 vocab.txt（此处使用仓库内 en-US 音素表）
-    dir: dataset/release/en-US
+    # ipa_symbol：目录内需有 vocab.txt（使用新预处理产物）
+    dir: dataset/normal/en-US
     type: ipa_symbol
 
   train_ds:
@@ -75,8 +76,8 @@ model:
     dataloader_params:
       drop_last: false
       shuffle: true
-      batch_size: 8
-      num_workers: 2
+      batch_size: 32
+      num_workers: 8
 
   validation_ds:
     manifest_filepath: ${validation_manifest}
@@ -87,8 +88,8 @@ model:
     dataloader_params:
       drop_last: false
       shuffle: false
-      batch_size: 8
-      num_workers: 2
+      batch_size: 32
+      num_workers: 4
 
   test_ds:
     manifest_filepath: ${test_manifest}
@@ -99,8 +100,8 @@ model:
     dataloader_params:
       drop_last: false
       shuffle: false
-      batch_size: 8
-      num_workers: 0
+      batch_size: 32
+      num_workers: 2
 
   optim:
     name: adamw
@@ -110,21 +111,21 @@ model:
     sched:
       name: NoamAnnealing
       d_model: ${model.encoder.d_model}
-      warmup_steps: 1000
+      warmup_steps: 8000
       warmup_ratio: null
       min_lr: 1e-6
 
 trainer:
   devices: 1
-  max_epochs: 30
+  max_epochs: 400
   num_nodes: 1
-  accelerator: auto
+  accelerator: gpu
   strategy: auto
-  precision: 32
+  precision: 16
   accumulate_grad_batches: 1
-  enable_checkpointing: False
+  enable_checkpointing: True
   logger: False
-  log_every_n_steps: 200
+  log_every_n_steps: 50
   check_val_every_n_epoch: 1
 
 exp_manager:
@@ -133,7 +134,8 @@ exp_manager:
   create_tensorboard_logger: True
   create_checkpoint_callback: True
   checkpoint_callback_params:
-    save_top_k: 1
+    save_top_k: -1
     monitor: "val_per"
     mode: "min"
     save_best_model: true
+    every_n_epochs: 1
