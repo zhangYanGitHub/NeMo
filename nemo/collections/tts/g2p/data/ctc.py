@@ -14,6 +14,7 @@
 
 import json
 import os
+import random
 from typing import List
 
 import torch
@@ -22,7 +23,53 @@ from transformers import PreTrainedTokenizerBase
 from nemo.core.classes import Dataset
 from nemo.utils import logging
 
-__all__ = ["CTCG2PBPEDataset"]
+__all__ = ["CTCG2PBPEDataset", "LengthBucketingBatchSampler"]
+
+
+class LengthBucketingBatchSampler(torch.utils.data.Sampler):
+    """Groups samples of similar length into the same batch to minimize padding.
+
+    For G2P the grapheme inputs vary a lot in length (single words vs. long
+    sentences). With random batching every batch is padded to its longest
+    member, wasting Conformer compute (attention is O(L^2)). Sorting by length
+    and chunking into batches keeps padding close to zero. Batch *order* is
+    reshuffled every epoch to preserve stochasticity across steps.
+    """
+
+    def __init__(self, lengths: List[int], batch_size: int, shuffle: bool = True, drop_last: bool = False, seed: int = 0):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+        self._sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+
+    def _make_batches(self):
+        batches = [
+            self._sorted_indices[i : i + self.batch_size]
+            for i in range(0, len(self._sorted_indices), self.batch_size)
+        ]
+        if self.drop_last and batches and len(batches[-1]) < self.batch_size:
+            batches = batches[:-1]
+        return batches
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        batches = self._make_batches()
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(batches)
+            self.epoch += 1
+        yield from batches
+
+    def __len__(self):
+        n = len(self._sorted_indices)
+        if self.drop_last:
+            return n // self.batch_size
+        return (n + self.batch_size - 1) // self.batch_size
 
 
 class CTCG2PBPEDataset(Dataset):
@@ -123,6 +170,16 @@ class CTCG2PBPEDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+    def get_lengths(self) -> List[int]:
+        """Returns the grapheme (input) length of every example, used for length bucketing."""
+        lengths = []
+        for entry in self.data:
+            if "input_ids" in entry:
+                lengths.append(len(entry["input_ids"]))
+            else:
+                lengths.append(len(entry["graphemes"]))
+        return lengths
 
     def __getitem__(self, index):
         return self.data[index]

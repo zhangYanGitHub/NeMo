@@ -66,6 +66,9 @@ This script supports training of G2PModels
 
 @hydra_runner(config_path="conf", config_name="g2p_t5")
 def main(cfg):
+    # Enable TF32 on Tensor Cores (Ampere+ GPUs like RTX 4090) for faster fp32 matmuls.
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
     trainer = pl.Trainer(**cfg.trainer)
     exp_manager(trainer, cfg.get("exp_manager", None))
 

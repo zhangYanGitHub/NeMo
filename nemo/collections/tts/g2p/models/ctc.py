@@ -23,7 +23,7 @@ from lightning.pytorch import Trainer
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-from nemo.collections.tts.g2p.data.ctc import CTCG2PBPEDataset
+from nemo.collections.tts.g2p.data.ctc import CTCG2PBPEDataset, LengthBucketingBatchSampler
 from nemo.collections.tts.models.base import G2PModel
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.exportable import Exportable
@@ -392,7 +392,27 @@ class CTCG2PModel(G2PModel, ASRBPEMixin, Exportable):
             with_labels=True,
         )
 
-        return torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, **cfg.dataloader_params)
+        # Optional length bucketing: groups similar-length samples per batch to
+        # cut padding waste in the Conformer encoder. Big single-GPU speedup on
+        # variable-length G2P data. Enable via cfg.dataloader_params.use_length_bucketing=true
+        dataloader_params = dict(cfg.dataloader_params)
+        use_length_bucketing = dataloader_params.pop("use_length_bucketing", False)
+        if use_length_bucketing:
+            batch_size = dataloader_params.pop("batch_size")
+            shuffle = dataloader_params.pop("shuffle", False)
+            drop_last = dataloader_params.pop("drop_last", False)
+            batch_sampler = LengthBucketingBatchSampler(
+                lengths=dataset.get_lengths(),
+                batch_size=batch_size,
+                shuffle=shuffle,
+                drop_last=drop_last,
+            )
+            logging.info(f"[{name}] Length bucketing enabled (batch_size={batch_size}, shuffle={shuffle}).")
+            return torch.utils.data.DataLoader(
+                dataset, collate_fn=dataset.collate_fn, batch_sampler=batch_sampler, **dataloader_params
+            )
+
+        return torch.utils.data.DataLoader(dataset, collate_fn=dataset.collate_fn, **dataloader_params)
 
     def setup_training_data(self, cfg: DictConfig):
         if not cfg or cfg.manifest_filepath is None:

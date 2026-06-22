@@ -33,9 +33,12 @@ model:
     n_layers: 12
     d_model: 512
 
-    # 先保持与你现有训练命令一致，优先验证准确性
+    # G2P 不能降采样：CTC 要求 encoder 时间步 T >= 目标音素数 U。
+    # 输入是字符、输出是音素，二者长度相近；factor=2 会让 T≈字符/2 < 音素数，
+    # 绝大多数样本无法对齐（zero_infinity 把 loss 置 0、无梯度），导致 PER 高居不下。
+    # factor=1 时 encoder 走不降采样的 Linear 分支，T=字符长度，才能正确对齐。
     subsampling: striding
-    subsampling_factor: 2
+    subsampling_factor: 1
     subsampling_conv_channels: -1
 
     ff_expansion_factor: 4
