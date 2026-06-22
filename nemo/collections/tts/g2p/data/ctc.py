@@ -96,14 +96,17 @@ class CTCG2PBPEDataset(Dataset):
                         removed_source_max += 1
                         continue
 
-                    self.data.append(
-                        {
-                            "graphemes": item[grapheme_field],
-                            "phonemes": item[phoneme_field],
-                            "target": target_tokens,
-                            "target_len": target_len,
-                        }
-                    )
+                    data_entry = {
+                        "graphemes": item[grapheme_field],
+                        "phonemes": item[phoneme_field],
+                        "target": target_tokens,
+                        "target_len": target_len,
+                    }
+                    # Cache grapheme ids for the Conformer (non-HF) tokenizer to avoid
+                    # re-tokenizing the same string every batch / every epoch in collate_fn.
+                    if not isinstance(self.tokenizer_graphemes, PreTrainedTokenizerBase):
+                        data_entry["input_ids"] = grapheme_tokens
+                    self.data.append(data_entry)
                 else:
                     if len(grapheme_tokens) > max_source_len:
                         item[grapheme_field] = item[grapheme_field][:max_source_len]
@@ -148,7 +151,10 @@ class CTCG2PBPEDataset(Dataset):
             input_len = torch.sum(attention_mask, 1) - 1
         else:
             # for Conformer encoder
-            input_ids = [self.tokenizer_graphemes.text_to_ids(sentence) for sentence in graphemes_batch]
+            if all("input_ids" in entry for entry in batch):
+                input_ids = [list(entry["input_ids"]) for entry in batch]
+            else:
+                input_ids = [self.tokenizer_graphemes.text_to_ids(sentence) for sentence in graphemes_batch]
             input_len = [len(entry) for entry in input_ids]
             max_len = max(input_len)
             input_ids = [entry + [0] * (max_len - entry_len) for entry, entry_len in zip(input_ids, input_len)]

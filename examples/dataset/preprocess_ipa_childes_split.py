@@ -266,9 +266,9 @@ def write_vocab(path: Path, tokens: Sequence[str]) -> None:
 def recommend_runtime(cpu_count: int) -> tuple[int, int]:
     """Return (workers, batch_size) tuned for large CSV preprocessing."""
     cpu_count = max(1, cpu_count)
-    # Leave a small CPU headroom for OS / IO threads.
+    # Leave a small CPU headroom for OS / IO threads. espeak phonemize is CPU-bound,
+    # so scale with the full core count (no artificial 24-worker cap) for large datasets.
     workers = max(1, cpu_count - 2)
-    workers = min(workers, 24)
 
     if cpu_count <= 8:
         batch_size = 2048
