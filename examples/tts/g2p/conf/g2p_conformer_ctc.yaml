@@ -21,7 +21,8 @@ model:
     unk_token: "<unk>"
     vocab_file: null
     do_lower: true
-    add_punctuation: false
+    # 开启标点：保留逗号/句号等进入 grapheme 词表，模型才能在标点处学到停顿（piper 合成气口）。
+    add_punctuation: true
 
   embedding:
     d_model: 512
