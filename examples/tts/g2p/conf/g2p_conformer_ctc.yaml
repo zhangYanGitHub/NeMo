@@ -13,7 +13,7 @@ pretrained_model: null # path to .nemo file or model name from list_available_mo
 model:
   model_name: conformer_bpe
   # 先留足长度，减少长词/短句被截断带来的准确率损失
-  max_source_len: 128
+  max_source_len: 256
 
   tokenizer_grapheme:
     dataset:
