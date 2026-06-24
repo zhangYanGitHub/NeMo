@@ -20,9 +20,12 @@ model:
       _target_: nemo.collections.common.tokenizers.char_tokenizer.CharTokenizer
     unk_token: "<unk>"
     vocab_file: null
-    do_lower: true
-    # 开启标点：保留逗号/句号等进入 grapheme 词表，模型才能在标点处学到停顿（piper 合成气口）。
-    add_punctuation: true
+    # 保留大小写：espeak 对 B15/I-5/US-101 等按字母名发音依赖大小写；lower 会让
+    # "US"(字母) 和 "us"(单词) 塌成同一输入却要对应不同音素，训练信号打架。
+    do_lower: false
+    # 纯净 G2P：标点不进 grapheme 词表。前端按 split_into_segments() 切分后送无标点片段，
+    # 停顿由前端在片段间按规则插入 , / . token（与训练数据 --split-on-punctuation 对齐）。
+    add_punctuation: false
 
   embedding:
     d_model: 512

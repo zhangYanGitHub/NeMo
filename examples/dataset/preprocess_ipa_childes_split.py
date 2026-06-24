@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import unicodedata
 from collections import Counter
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Iterator, List, Sequence, Tuple
 
 from piper_phonemize import phonemize_espeak  # type: ignore[reportMissingImports]
+from text_normalize import normalize_for_g2p
 from tqdm import tqdm
 
 ZWJ = "\u200d"
@@ -48,6 +50,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=0, help="rows per worker batch; 0 means auto by CPU count")
     parser.add_argument("--limit", type=int, default=0, help="optional row limit")
     parser.add_argument("--stress", choices=["attach", "separate", "drop"], default="attach")
+    parser.add_argument(
+        "--strip-punctuation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Strip pause/sentence punctuation from text BEFORE phonemizing so neither "
+            "text_graphemes nor the phoneme target contains punctuation tokens "
+            "(pure G2P; pauses are inserted by the frontend). Keeps apostrophes/hyphens."
+        ),
+    )
+    parser.add_argument(
+        "--split-on-punctuation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Split each sentence at pause/sentence punctuation into segments and emit "
+            "ONE manifest line per segment, matching the frontend that sends each "
+            "segment to the G2P model separately (train==serve). Segments are always "
+            "punctuation-free. Use the shared split_into_segments() in the frontend."
+        ),
+    )
+    parser.add_argument(
+        "--normalize-numbers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Expand digits/codes to spoken words (text_normalize.normalize_for_g2p) "
+            "BEFORE phonemizing, because the grapheme vocab has no digits (raw digits "
+            "would be dropped). MUST be applied identically in the inference frontend."
+        ),
+    )
     parser.add_argument("--manifest-name", type=str, default="train.json")
     parser.add_argument("--phoneme-vocab-name", type=str, default="phoneme_vocab.txt")
     parser.add_argument("--grapheme-vocab-name", type=str, default="grapheme_vocab.txt")
@@ -59,6 +92,43 @@ def parse_args() -> argparse.Namespace:
 
 def normalize_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFC", text).split())
+
+
+# Pause/sentence punctuation to strip for the "pure G2P + frontend-inserted pause"
+# pipeline. We deliberately KEEP characters that change pronunciation rather than
+# act as pauses: apostrophes (contractions: don't, it's) and hyphen (well-known).
+_PUNCT_STRIP = frozenset('.,!?;:"()[]{}<>…—–«»‹›„“”/\\|*&^%$#@~`')
+
+
+def strip_punctuation(text: str) -> str:
+    """Remove pause/sentence punctuation so the espeak target carries no
+    punctuation tokens. Punct is replaced by a space (not deleted) to avoid
+    merging adjacent words, then whitespace is collapsed."""
+    cleaned = "".join(" " if ch in _PUNCT_STRIP else ch for ch in text)
+    return " ".join(cleaned.split())
+
+
+def is_punct_unit(unit: str) -> bool:
+    """A segmented phoneme unit that is purely strip-punctuation (defensive)."""
+    return bool(unit) and all(ch in _PUNCT_STRIP for ch in unit)
+
+
+# Pause/sentence boundaries the frontend splits on before sending each segment to
+# the G2P model. THIS RULE MUST BE IDENTICAL in training data prep and inference
+# frontend, otherwise the model sees different inputs at train vs serve time.
+_SEGMENT_SPLIT_RE = re.compile(r"[.,!?;:…]+|[—–]+")
+
+
+def split_into_segments(text: str) -> List[str]:
+    """Split a (normalized) sentence at pause/sentence punctuation into the exact
+    punctuation-free segments the frontend will send to the G2P model. Each segment
+    is additionally cleaned of any residual (non-splitting) punctuation."""
+    segments: List[str] = []
+    for piece in _SEGMENT_SPLIT_RE.split(text):
+        seg = strip_punctuation(piece)
+        if seg:
+            segments.append(seg)
+    return segments
 
 
 def normalize_voice(voice: str) -> str:
@@ -138,7 +208,15 @@ def run_phonemize_batch(texts: Sequence[str], voice: str) -> List[str]:
     return out_lines
 
 
-def iter_csv_rows(csv_path: Path, text_field: str, lang_field: str, limit: int) -> Iterator[Tuple[str, str]]:
+def iter_csv_rows(
+    csv_path: Path,
+    text_field: str,
+    lang_field: str,
+    limit: int,
+    strip_punct: bool = False,
+    split_punct: bool = False,
+    normalize_nums: bool = False,
+) -> Iterator[Tuple[str, str]]:
     seen = 0
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
@@ -156,13 +234,25 @@ def iter_csv_rows(csv_path: Path, text_field: str, lang_field: str, limit: int) 
             if text_idx >= len(row):
                 continue
             text = normalize_text(row[text_idx])
+            if normalize_nums:
+                text = normalize_for_g2p(text)
             if not text:
                 continue
             lang = row[lang_idx].strip() if lang_idx < len(row) else ""
-            yield (lang, text)
-            seen += 1
-            if limit > 0 and seen >= limit:
-                break
+
+            if split_punct:
+                segments = split_into_segments(text)
+            elif strip_punct:
+                seg = strip_punctuation(text)
+                segments = [seg] if seg else []
+            else:
+                segments = [text]
+
+            for seg in segments:
+                yield (lang, seg)
+                seen += 1
+                if limit > 0 and seen >= limit:
+                    return
 
 
 def iter_batches(rows: Iterator[Tuple[str, str]], batch_size: int) -> Iterator[List[Tuple[str, str]]]:
@@ -192,6 +282,7 @@ def ordered_process_batches(
     batches_iter: Iterator[List[Tuple[str, str]]],
     default_voice: str,
     stress_mode: str,
+    strip_punct: bool = False,
 ) -> Iterator[List[Tuple[str, str]]]:
     """Like executor.map(process_batch, ...) but submit only max_in_flight tasks ahead; preserve order."""
     it = enumerate(batches_iter)
@@ -208,7 +299,7 @@ def ordered_process_batches(
             except StopIteration:
                 exhausted = True
                 return
-            fut = executor.submit(process_batch, batch, default_voice, stress_mode)
+            fut = executor.submit(process_batch, batch, default_voice, stress_mode, strip_punct)
             pending[fut] = idx
 
     def emit_ready() -> Iterator[List[Tuple[str, str]]]:
@@ -234,6 +325,7 @@ def process_batch(
     batch_rows: Sequence[Tuple[str, str]],
     default_voice: str,
     stress_mode: str,
+    strip_punct: bool = False,
 ) -> List[Tuple[str, str]]:
     results: List[Tuple[str, str]] = [("", "")] * len(batch_rows)
     by_voice: dict[str, List[Tuple[int, str]]] = {}
@@ -248,6 +340,8 @@ def process_batch(
         ipa_lines = run_phonemize_batch(texts, voice=voice)
         for (src_idx, src_text), ipa_line in zip(indexed_texts, ipa_lines):
             units = segment_word(ipa_line, stress_mode=stress_mode)
+            if strip_punct:
+                units = [u for u in units if not is_punct_unit(u)]
             results[src_idx] = (src_text, " ".join(units))
 
     return results
@@ -319,7 +413,22 @@ def main() -> None:
         manifest_f.write("\n")
         manifest_buffer = []
 
-    batch_iter = iter_batches(iter_csv_rows(input_csv, args.text_field, args.lang_field, args.limit), batch_size)
+    # Splitting always yields punctuation-free segments, so the phoneme-side defensive
+    # filter must run whenever either stripping or splitting is on.
+    effective_strip = args.strip_punctuation or args.split_on_punctuation
+
+    batch_iter = iter_batches(
+        iter_csv_rows(
+            input_csv,
+            args.text_field,
+            args.lang_field,
+            args.limit,
+            args.strip_punctuation,
+            args.split_on_punctuation,
+            args.normalize_numbers,
+        ),
+        batch_size,
+    )
 
     with manifest_path.open("w", encoding="utf-8") as manifest_f:
         with executor_cls(max_workers=workers) as executor:
@@ -329,6 +438,7 @@ def main() -> None:
                 batch_iter,
                 args.default_voice,
                 args.stress,
+                effective_strip,
             )
             if args.show_progress:
                 ordered = tqdm(
@@ -382,6 +492,9 @@ def main() -> None:
         f"CPU: {cpu_count}, workers: {workers}, executor: {args.executor}, "
         f"batch size: {batch_size}"
     )
+    print(f"Strip punctuation: {args.strip_punctuation} (no punctuation tokens in text_graphemes/text)")
+    print(f"Split on punctuation: {args.split_on_punctuation} (one manifest line per segment; train==serve)")
+    print(f"Normalize numbers: {args.normalize_numbers} (digits/codes -> words; MUST match frontend TN)")
     print(f"Manifest: {manifest_path}")
     if args.write_vocab:
         print(f"Phoneme vocab: {phoneme_vocab_path}")
