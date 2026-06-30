@@ -21,11 +21,16 @@ SCOPE (deliberately conservative)
                                                "221B" -> "two hundred twenty one B",
                                                "US-101" -> "US one hundred one",
                                                "I-5" -> "I five")
-    * ONLY tokens that contain a digit are touched. Pure-letter words and
-      abbreviations (NW, US, well-known, don't) are left untouched on purpose:
-      they survive to the model as-is (do_lower=false keeps their case), and
-      abbreviation expansion (NW->northwest, US->United States) is domain-specific
-      TN that belongs upstream, not here.
+    * hyphens between alphabetic words -> word boundary (space). In English a hyphen is
+      an orthographic joiner of independently-spoken words (compound modifiers, prefixes,
+      spelled numbers: "well-known", "non-stop", "twenty-five"), so the spoken form equals
+      the same words with spaces. KEPT when a part is a single letter ("A-frame", "U-turn",
+      "X-ray"), which English pronounces as a letter name; a space would reduce it.
+    * Number rules ONLY touch tokens that contain a digit. Pure-letter words and
+      abbreviations (NW, US, don't) are otherwise left untouched on purpose: they
+      survive to the model as-is (do_lower=false keeps their case), and abbreviation
+      expansion (NW->northwest, US->United States) is domain-specific TN that belongs
+      upstream, not here.
 
 FIDELITY NOTE
     The exact spoken form must match espeak (e.g. "101" -> "one hundred one" vs
@@ -118,12 +123,55 @@ def _transform_token(token: str) -> str:
     return " ".join(out_parts)
 
 
+# English rule for hyphens between alphabetic words.
+#
+# In English a hyphen joins tokens that are each pronounced as their own word
+# (compound modifiers: "well-known", "high-speed"; compound nouns: "mother-in-law";
+# prefixes: "non-stop", "anti-lock"; spelled numbers: "twenty-five"). The hyphen is an
+# orthographic joiner, not a phonetic unit, so the spoken form equals the same words
+# written with spaces. We therefore render such hyphens as a word boundary (space),
+# giving the canonical multi-word grapheme form regardless of how the source spelled it.
+#
+# EXCEPTION — single-letter parts. When a part is one letter, English pronounces it as
+# the LETTER NAME, not as a reduced word ("A-frame" = AY-, "U-turn" = YOO-, "X-ray" =
+# EX-, "e-mail" = EE-). Replacing the hyphen with a space would let the part collapse to
+# an unstressed word vowel (a -> schwa). Keep the hyphen so the letter-name reading holds.
+#
+# Digit-bearing codes (US-101, I-5) are out of scope here and handled by the number
+# rules below, which already treat the hyphen as a separator.
+_ALPHA_HYPHEN_RE = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)+")
+
+
+def _split_hyphen_compound(m: re.Match) -> str:
+    parts = m.group(0).split("-")
+    # A single-letter part is spoken as a letter name; keep it bound by the hyphen.
+    if any(len(p) == 1 for p in parts):
+        return m.group(0)
+    return " ".join(parts)
+
+
+def normalize_hyphens(text: str) -> str:
+    """Render hyphens between alphabetic words as word boundaries (spaces), since the
+    hyphen is an orthographic joiner whose spoken form equals the space-separated words.
+    Keep the hyphen when a part is a single letter (letter-name reading: A-frame, U-turn,
+    X-ray). Digit-bearing codes (US-101, I-5) are left for the number rules below."""
+    if "-" not in text:
+        return text
+    return _ALPHA_HYPHEN_RE.sub(_split_hyphen_compound, text)
+
+
 def normalize_for_g2p(text: str) -> str:
     """Expand digits/codes to spoken words so nothing is dropped by the digit-free
-    grapheme vocab. Only tokens containing a digit are modified; everything else is
-    preserved verbatim. Whitespace is collapsed."""
-    if not text or not any(ch.isdigit() for ch in text):
+    grapheme vocab, and normalize alphabetic hyphen compounds (off-road -> off road).
+    Only tokens containing a digit are number-expanded; everything else is preserved
+    verbatim. Whitespace is collapsed."""
+    if not text:
         return text
+
+    text = normalize_hyphens(text)
+
+    if not any(ch.isdigit() for ch in text):
+        return " ".join(text.split())
 
     def repl(m: re.Match) -> str:
         tok = m.group(0)
@@ -145,8 +193,13 @@ def _verify() -> None:
         return "".join("".join(s) for s in phonemize_espeak(t, "en-us"))
 
     cases = [
+        # number / code rules
         "B15", "221B Baker Street", "US-101", "I-5", "M25",
         "In 500 meters turn right", "exit 45th street", "1024",
+        # hyphen rule by English category: compound modifier, prefix, spelled number,
+        # then single-letter (letter-name) which must KEEP the hyphen
+        "a well-known high-speed route", "a non-stop anti-lock test",
+        "twenty-five north-bound lanes", "take a U-turn", "an A-frame and an e-mail",
     ]
     for raw in cases:
         tn = normalize_for_g2p(raw)
