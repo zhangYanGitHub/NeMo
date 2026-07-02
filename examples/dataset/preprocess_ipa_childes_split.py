@@ -14,15 +14,11 @@ from pathlib import Path
 from typing import Iterator, List, Sequence, Tuple
 
 from piper_phonemize import phonemize_espeak  # type: ignore[reportMissingImports]
-from text_normalize import normalize_for_g2p
+from text_normalize import normalize_for_g2p, normalize_for_g2p_phonemize
 from tqdm import tqdm
 
-ZWJ = "\u200d"
-TIES = {ZWJ, "\u0361", "\u035c"}
 PRIMARY_STRESS = "\u02c8"  # ˈ
 SECONDARY_STRESS = "\u02cc"  # ˌ
-STRESS = {PRIMARY_STRESS, SECONDARY_STRESS}
-LENGTH = "\u02d0"  # ː
 SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
 
@@ -135,67 +131,11 @@ def normalize_voice(voice: str) -> str:
     return voice.strip().lower().replace("_", "-")
 
 
-def is_attaching(ch: str) -> bool:
-    if ch == LENGTH:
-        return True
-    return unicodedata.combining(ch) != 0
-
-
-def segment_word(ipa: str, stress_mode: str = "attach") -> List[str]:
-    units: List[str] = []
-    cur = ""
-    pending_stress = ""
-    join = False
-
-    def flush() -> None:
-        nonlocal cur
-        if cur:
-            units.append(cur)
-            cur = ""
-
-    for ch in ipa:
-        if ch in TIES:
-            join = True
-            continue
-
-        if ch in STRESS:
-            flush()
-            if stress_mode == "separate":
-                units.append(ch)
-            elif stress_mode == "attach":
-                pending_stress += ch
-            join = False
-            continue
-
-        if ch.isspace():
-            flush()
-            pending_stress = ""
-            join = False
-            continue
-
-        if is_attaching(ch):
-            if not cur:
-                cur = pending_stress
-                pending_stress = ""
-            cur += ch
-            continue
-
-        if join and cur:
-            cur += ch
-            join = False
-        else:
-            flush()
-            cur = pending_stress + ch
-            pending_stress = ""
-            join = False
-
-    flush()
-    return units
-
-
 def run_phonemize(text: str, voice: str) -> str:
+    """Return piper/espeak IPA in word-level format: each word's phonemes
+    concatenated, words separated by a single space — identical to the
+    ``phoneme_lists_to_ipa`` helper in generate_g2p_manifest_espeak.py."""
     phoneme_lists = phonemize_espeak(text, voice)
-    # Keep behavior aligned with generate_g2p_manifest_espeak.py.
     return "".join("".join(sentence) for sentence in phoneme_lists)
 
 
@@ -216,7 +156,15 @@ def iter_csv_rows(
     strip_punct: bool = False,
     split_punct: bool = False,
     normalize_nums: bool = False,
-) -> Iterator[Tuple[str, str]]:
+) -> Iterator[Tuple[str, str, str]]:
+    """Yield ``(lang, grapheme_text, phonemize_text)`` triples.
+
+    *grapheme_text* is the model's input (clean TN, no digits).
+    *phonemize_text* is fed to piper/espeak; for digit+letter-A tokens it uses
+    the "A-" form (via :func:`normalize_for_g2p_phonemize`) so that espeak reads
+    the letter "A" as a letter name (ˈeɪ) instead of the indefinite article (ɐ).
+    For all other tokens the two texts are identical.
+    """
     seen = 0
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
@@ -233,30 +181,41 @@ def iter_csv_rows(
         for row in reader:
             if text_idx >= len(row):
                 continue
-            text = normalize_text(row[text_idx])
-            if normalize_nums:
-                text = normalize_for_g2p(text)
-            if not text:
+            raw = normalize_text(row[text_idx])
+            if not raw:
                 continue
             lang = row[lang_idx].strip() if lang_idx < len(row) else ""
 
-            if split_punct:
-                segments = split_into_segments(text)
-            elif strip_punct:
-                seg = strip_punctuation(text)
-                segments = [seg] if seg else []
+            if normalize_nums:
+                grapheme = normalize_for_g2p(raw)
+                ph_text = normalize_for_g2p_phonemize(raw)
             else:
-                segments = [text]
+                grapheme = raw
+                ph_text = raw
 
-            for seg in segments:
-                yield (lang, seg)
-                seen += 1
-                if limit > 0 and seen >= limit:
-                    return
+            if split_punct:
+                grapheme_segs = split_into_segments(grapheme)
+                # phonemize_text may differ only in "A-" vs "A"; punctuation
+                # positions are identical, so we can segment both the same way.
+                ph_segs = split_into_segments(ph_text)
+                segment_pairs = list(zip(grapheme_segs, ph_segs))
+            elif strip_punct:
+                g_seg = strip_punctuation(grapheme)
+                p_seg = strip_punctuation(ph_text)
+                segment_pairs = [(g_seg, p_seg)] if g_seg else []
+            else:
+                segment_pairs = [(grapheme, ph_text)]
+
+            for g_seg, p_seg in segment_pairs:
+                if g_seg:
+                    yield (lang, g_seg, p_seg)
+                    seen += 1
+                    if limit > 0 and seen >= limit:
+                        return
 
 
-def iter_batches(rows: Iterator[Tuple[str, str]], batch_size: int) -> Iterator[List[Tuple[str, str]]]:
-    batch: List[Tuple[str, str]] = []
+def iter_batches(rows: Iterator[Tuple[str, str, str]], batch_size: int) -> Iterator[List[Tuple[str, str, str]]]:
+    batch: List[Tuple[str, str, str]] = []
     for row in rows:
         batch.append(row)
         if len(batch) >= batch_size:
@@ -279,7 +238,7 @@ def approx_csv_body_line_count(csv_path: Path) -> int:
 def ordered_process_batches(
     executor: Executor,
     max_in_flight: int,
-    batches_iter: Iterator[List[Tuple[str, str]]],
+    batches_iter: Iterator[List[Tuple[str, str, str]]],
     default_voice: str,
     stress_mode: str,
     strip_punct: bool = False,
@@ -322,27 +281,36 @@ def ordered_process_batches(
 
 
 def process_batch(
-    batch_rows: Sequence[Tuple[str, str]],
+    batch_rows: Sequence[Tuple[str, str, str]],
     default_voice: str,
     stress_mode: str,
     strip_punct: bool = False,
 ) -> List[Tuple[str, str]]:
+    """Phonemize a batch of (lang, grapheme_text, phonemize_text) rows.
+
+    Returns (grapheme_text, phoneme_ipa) pairs in the same word-level format
+    as generate_g2p_manifest_espeak.py: word phonemes concatenated, words
+    separated by a single space.  The *phonemize_text* column is fed to
+    piper/espeak (it may differ from *grapheme_text* by the "A-" letter-name
+    trick for digit+A tokens); the *grapheme_text* column is written to the
+    manifest as-is.
+    """
     results: List[Tuple[str, str]] = [("", "")] * len(batch_rows)
-    by_voice: dict[str, List[Tuple[int, str]]] = {}
-    for i, (lang, text) in enumerate(batch_rows):
+    by_voice: dict[str, List[Tuple[int, str, str]]] = {}
+    for i, (lang, grapheme, ph_text) in enumerate(batch_rows):
         voice = normalize_voice(lang) if lang else default_voice
         if not voice:
             voice = default_voice
-        by_voice.setdefault(voice, []).append((i, text))
+        by_voice.setdefault(voice, []).append((i, grapheme, ph_text))
 
-    for voice, indexed_texts in by_voice.items():
-        texts = [t for _, t in indexed_texts]
-        ipa_lines = run_phonemize_batch(texts, voice=voice)
-        for (src_idx, src_text), ipa_line in zip(indexed_texts, ipa_lines):
-            units = segment_word(ipa_line, stress_mode=stress_mode)
-            if strip_punct:
-                units = [u for u in units if not is_punct_unit(u)]
-            results[src_idx] = (src_text, " ".join(units))
+    for voice, indexed_items in by_voice.items():
+        phon_texts = [pt for _, _, pt in indexed_items]
+        ipa_lines = run_phonemize_batch(phon_texts, voice=voice)
+        for (src_idx, src_grapheme, _), ipa_line in zip(indexed_items, ipa_lines):
+            phoneme_str = ipa_line.strip()
+            if stress_mode == "drop":
+                phoneme_str = phoneme_str.replace(PRIMARY_STRESS, "").replace(SECONDARY_STRESS, "")
+            results[src_idx] = (src_grapheme, phoneme_str)
 
     return results
 
@@ -458,6 +426,9 @@ def main() -> None:
                         continue
                     manifest_buffer.append(json.dumps({"text_graphemes": text, "text": phoneme_text}, ensure_ascii=False))
                     grapheme_counter.update(text)
+                    # phoneme_text is word-level IPA (e.g. "ˈoʊ ɐ bˈaɪsɪkəl"):
+                    # split by space gives per-word phoneme strings; count each
+                    # word string as a token so the vocab mirrors the manifest format.
                     phoneme_counter.update(phoneme_text.split())
                     processed_rows += 1
                     if len(manifest_buffer) >= MANIFEST_WRITE_BUFFER_LINES:
