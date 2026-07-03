@@ -22,6 +22,36 @@ SECONDARY_STRESS = "\u02cc"  # ˌ
 SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
 
+# espeak-ng en-US 常见多字符 IPA 原子，按最长匹配切分。
+DEFAULT_EN_US_ESPEAK_IPA_TOKENS: Tuple[str, ...] = (
+    "t͡ʃ", "d͡ʒ", "tʃ", "dʒ",
+    "eɪ", "aɪ", "ɔɪ", "aʊ", "oʊ",
+    "ɚ", "ɝ",
+    "aɪə", "aɪɚ",
+    "l̩", "m̩", "n̩", "r̩",
+    "iː", "uː", "ɑː", "ɔː", "ɜː",
+    "ɑːɹ", "ɔːɹ", "ɛɹ", "ɪɹ", "ʊɹ",
+)
+
+
+def longest_match_tokenize(text: str, multi_tokens: Sequence[str]) -> List[str]:
+    tokens: List[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        matched = None
+        for tok in multi_tokens:
+            if text.startswith(tok, i):
+                matched = tok
+                break
+        if matched is not None:
+            tokens.append(matched)
+            i += len(matched)
+        else:
+            tokens.append(text[i])
+            i += 1
+    return tokens
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -368,6 +398,7 @@ def main() -> None:
     else:
         est_batches = None
 
+    candidate_multi_sorted = tuple(sorted(DEFAULT_EN_US_ESPEAK_IPA_TOKENS, key=lambda x: (-len(x), x)))
     phoneme_counter: Counter = Counter()
     grapheme_counter: Counter = Counter()
     processed_rows = 0
@@ -426,10 +457,10 @@ def main() -> None:
                         continue
                     manifest_buffer.append(json.dumps({"text_graphemes": text, "text": phoneme_text}, ensure_ascii=False))
                     grapheme_counter.update(text)
-                    # phoneme_text is word-level IPA (e.g. "ˈoʊ ɐ bˈaɪsɪkəl"):
-                    # split by space gives per-word phoneme strings; count each
-                    # word string as a token so the vocab mirrors the manifest format.
-                    phoneme_counter.update(phoneme_text.split())
+                    # 用 IPA 原子切分统计 vocab（而不是整词 IPA token）。
+                    for tok in longest_match_tokenize(phoneme_text, candidate_multi_sorted):
+                        if tok != " ":
+                            phoneme_counter.update([tok])
                     processed_rows += 1
                     if len(manifest_buffer) >= MANIFEST_WRITE_BUFFER_LINES:
                         flush_manifest_buffer(manifest_f)
