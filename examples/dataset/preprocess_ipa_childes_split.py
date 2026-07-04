@@ -325,6 +325,9 @@ def process_batch(
     trick for digit+A tokens); the *grapheme_text* column is written to the
     manifest as-is.
     """
+    WORD_BOUNDARY = "\u2581"
+    candidate_multi_sorted = tuple(sorted(DEFAULT_EN_US_ESPEAK_IPA_TOKENS, key=lambda x: (-len(x), x)))
+    
     results: List[Tuple[str, str]] = [("", "")] * len(batch_rows)
     by_voice: dict[str, List[Tuple[int, str, str]]] = {}
     for i, (lang, grapheme, ph_text) in enumerate(batch_rows):
@@ -340,7 +343,20 @@ def process_batch(
             phoneme_str = ipa_line.strip()
             if stress_mode == "drop":
                 phoneme_str = phoneme_str.replace(PRIMARY_STRESS, "").replace(SECONDARY_STRESS, "")
-            results[src_idx] = (src_grapheme, phoneme_str)
+            
+            # 1. 拆分成细粒度的 IPA 音素
+            tokens = longest_match_tokenize(phoneme_str, candidate_multi_sorted)
+            
+            # 2. 将单词之间的空格替换为特殊的占位符 (U+2581)，使其能够作为一个独立的 token 被 NeMo 切分
+            processed_tokens = []
+            for tok in tokens:
+                if tok == " ":
+                    processed_tokens.append(WORD_BOUNDARY)
+                else:
+                    processed_tokens.append(tok)
+            
+            # 3. 使用空格连接所有 token，以便 NeMo 的 IPASymbolTokenizer 能够通过 split() 正常读取
+            results[src_idx] = (src_grapheme, " ".join(processed_tokens))
 
     return results
 
@@ -457,10 +473,8 @@ def main() -> None:
                         continue
                     manifest_buffer.append(json.dumps({"text_graphemes": text, "text": phoneme_text}, ensure_ascii=False))
                     grapheme_counter.update(text)
-                    # 用 IPA 原子切分统计 vocab（而不是整词 IPA token）。
-                    for tok in longest_match_tokenize(phoneme_text, candidate_multi_sorted):
-                        if tok != " ":
-                            phoneme_counter.update([tok])
+                    # phoneme_text 已经是被空格分隔好的细粒度 token（含占位符），直接 split 统计即可
+                    phoneme_counter.update(phoneme_text.split())
                     processed_rows += 1
                     if len(manifest_buffer) >= MANIFEST_WRITE_BUFFER_LINES:
                         flush_manifest_buffer(manifest_f)
