@@ -17,40 +17,71 @@ from piper_phonemize import phonemize_espeak  # type: ignore[reportMissingImport
 from text_normalize import normalize_for_g2p, normalize_for_g2p_phonemize
 from tqdm import tqdm
 
+ZWJ = "\u200d"
+TIES = {ZWJ, "\u0361", "\u035c"}
 PRIMARY_STRESS = "\u02c8"  # ˈ
 SECONDARY_STRESS = "\u02cc"  # ˌ
+STRESS = {PRIMARY_STRESS, SECONDARY_STRESS}
+LENGTH = "\u02d0"  # ː
 SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
 
-# espeak-ng en-US 常见多字符 IPA 原子，按最长匹配切分。
-DEFAULT_EN_US_ESPEAK_IPA_TOKENS: Tuple[str, ...] = (
-    "t͡ʃ", "d͡ʒ", "tʃ", "dʒ",
-    "eɪ", "aɪ", "ɔɪ", "aʊ", "oʊ",
-    "ɚ", "ɝ",
-    "aɪə", "aɪɚ",
-    "l̩", "m̩", "n̩", "r̩",
-    "iː", "uː", "ɑː", "ɔː", "ɜː",
-    "ɑːɹ", "ɔːɹ", "ɛɹ", "ɪɹ", "ʊɹ",
-)
+def is_attaching(ch: str) -> bool:
+    if ch == LENGTH:
+        return True
+    return unicodedata.combining(ch) != 0
 
+def segment_word(ipa: str, stress_mode: str = "attach") -> List[str]:
+    units: List[str] = []
+    cur = ""
+    pending_stress = ""
+    join = False
 
-def longest_match_tokenize(text: str, multi_tokens: Sequence[str]) -> List[str]:
-    tokens: List[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        matched = None
-        for tok in multi_tokens:
-            if text.startswith(tok, i):
-                matched = tok
-                break
-        if matched is not None:
-            tokens.append(matched)
-            i += len(matched)
+    def flush() -> None:
+        nonlocal cur
+        if cur:
+            units.append(cur)
+            cur = ""
+
+    for ch in ipa:
+        if ch in TIES:
+            join = True
+            continue
+
+        if ch in STRESS:
+            flush()
+            if stress_mode == "separate":
+                units.append(ch)
+            elif stress_mode == "attach":
+                pending_stress += ch
+            join = False
+            continue
+
+        if ch.isspace():
+            flush()
+            pending_stress = ""
+            join = False
+            continue
+
+        if is_attaching(ch):
+            if not cur:
+                cur = pending_stress
+                pending_stress = ""
+            cur += ch
+            continue
+
+        if join and cur:
+            cur += ch
+            join = False
         else:
-            tokens.append(text[i])
-            i += 1
-    return tokens
+            flush()
+            cur = pending_stress + ch
+            pending_stress = ""
+            join = False
+
+    flush()
+    return units
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -320,8 +351,6 @@ def process_batch(
 
     Returns (grapheme_text, phoneme_ipa) pairs.
     """
-    candidate_multi_sorted = tuple(sorted(DEFAULT_EN_US_ESPEAK_IPA_TOKENS, key=lambda x: (-len(x), x)))
-    
     results: List[Tuple[str, str]] = [("", "")] * len(batch_rows)
     by_voice: dict[str, List[Tuple[int, str, str]]] = {}
     for i, (lang, grapheme, ph_text) in enumerate(batch_rows):
@@ -338,11 +367,10 @@ def process_batch(
             if stress_mode == "drop":
                 phoneme_str = phoneme_str.replace(PRIMARY_STRESS, "").replace(SECONDARY_STRESS, "")
             
-            # 使用用户原来的原子切分规则，把整个发音串切分成准确的最小单元，然后用空格连接
-            # 这样保证：模型能正确学到最小单元之间的映射，同时也不会因为切分过细（比如把aɪ拆成a和ɪ）导致 CTC 长度超限
-            tokens = longest_match_tokenize(phoneme_str, candidate_multi_sorted)
-            processed_tokens = [tok for tok in tokens if tok != " "]
-            results[src_idx] = (src_grapheme, " ".join(processed_tokens))
+            # 使用用户原来的字素级原子切分逻辑，恢复到7月2日之前的实现：
+            # 这能完美将重音依附在下一个音素上，同时正确保留发音特征不超长。
+            units = segment_word(phoneme_str, stress_mode=stress_mode)
+            results[src_idx] = (src_grapheme, " ".join(units))
 
     return results
 
@@ -400,7 +428,6 @@ def main() -> None:
     else:
         est_batches = None
 
-    candidate_multi_sorted = tuple(sorted(DEFAULT_EN_US_ESPEAK_IPA_TOKENS, key=lambda x: (-len(x), x)))
     phoneme_counter: Counter = Counter()
     grapheme_counter: Counter = Counter()
     processed_rows = 0
