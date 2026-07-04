@@ -17,40 +17,89 @@ from piper_phonemize import phonemize_espeak  # type: ignore[reportMissingImport
 from text_normalize import normalize_for_g2p, normalize_for_g2p_phonemize
 from tqdm import tqdm
 
+# Default tokens for IPASymbolTokenizer, defined in Nemo's defaults
+DEFAULT_EN_US_ESPEAK_IPA_TOKENS = [
+    " ",
+    "r",
+    "p",
+    "ɪ",
+    "ɾ",
+    "i",
+    "k",
+    "l",
+    "s",
+    "b",
+    "d",
+    "z",
+    "æ",
+    "ɛ",
+    "m",
+    "ð",
+    "t",
+    "j",
+    "n",
+    "w",
+    "ʊ",
+    "ɹ",
+    "u",
+    "ɑ",
+    "a",
+    "ə",
+    "h",
+    "f",
+    "v",
+    "ŋ",
+    "g",
+    "o",
+    "ɔ",
+    "θ",
+    "ʃ",
+    "ʒ",
+    "e",
+    "ɐ",
+    "ɚ",
+    "ɜ",
+    "ʌ",
+    "x",
+    "ˈ",
+    "ˌ",
+    "ː",
+    "̃",
+    "̍",
+    "̥",
+    "̩",
+    "̯",
+    "̃",
+    "aɪ",
+    "aʊ",
+    "ɔɪ",
+    "tʃ",
+    "dʒ",
+]
+
+def longest_match_tokenize(text: str, candidate_multi_sorted: tuple[str, ...]) -> list[str]:
+    """Tokenize a phoneme string using a longest-match strategy against a sorted tuple of candidates.
+    Assumes candidates are sorted descending by length."""
+    tokens = []
+    i = 0
+    while i < len(text):
+        matched = False
+        for cand in candidate_multi_sorted:
+            if text.startswith(cand, i):
+                tokens.append(cand)
+                i += len(cand)
+                matched = True
+                break
+        if not matched:
+            # If no match is found, just keep the character
+            tokens.append(text[i])
+            i += 1
+    return tokens
+
 PRIMARY_STRESS = "\u02c8"  # ˈ
 SECONDARY_STRESS = "\u02cc"  # ˌ
 SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
-
-# espeak-ng en-US 常见多字符 IPA 原子，按最长匹配切分。
-DEFAULT_EN_US_ESPEAK_IPA_TOKENS: Tuple[str, ...] = (
-    "t͡ʃ", "d͡ʒ", "tʃ", "dʒ",
-    "eɪ", "aɪ", "ɔɪ", "aʊ", "oʊ",
-    "ɚ", "ɝ",
-    "aɪə", "aɪɚ",
-    "l̩", "m̩", "n̩", "r̩",
-    "iː", "uː", "ɑː", "ɔː", "ɜː",
-    "ɑːɹ", "ɔːɹ", "ɛɹ", "ɪɹ", "ʊɹ",
-)
-
-
-def longest_match_tokenize(text: str, multi_tokens: Sequence[str]) -> List[str]:
-    tokens: List[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        matched = None
-        for tok in multi_tokens:
-            if text.startswith(tok, i):
-                matched = tok
-                break
-        if matched is not None:
-            tokens.append(matched)
-            i += len(matched)
-        else:
-            tokens.append(text[i])
-            i += 1
-    return tokens
 
 
 def parse_args() -> argparse.Namespace:
@@ -318,14 +367,11 @@ def process_batch(
 ) -> List[Tuple[str, str]]:
     """Phonemize a batch of (lang, grapheme_text, phonemize_text) rows.
 
-    Returns (grapheme_text, phoneme_ipa) pairs in the same word-level format
-    as generate_g2p_manifest_espeak.py: word phonemes concatenated, words
-    separated by a single space.  The *phonemize_text* column is fed to
-    piper/espeak (it may differ from *grapheme_text* by the "A-" letter-name
-    trick for digit+A tokens); the *grapheme_text* column is written to the
-    manifest as-is.
+    Returns (grapheme_text, phoneme_ipa) pairs.
+    Each token in phoneme_ipa is separated by a single space to fulfill the NeMo 
+    IPASymbolTokenizer requirement (it splits by space). The tokens will be the minimal 
+    IPA units defined in DEFAULT_EN_US_ESPEAK_IPA_TOKENS.
     """
-    WORD_BOUNDARY = "\u2581"
     candidate_multi_sorted = tuple(sorted(DEFAULT_EN_US_ESPEAK_IPA_TOKENS, key=lambda x: (-len(x), x)))
     
     results: List[Tuple[str, str]] = [("", "")] * len(batch_rows)
@@ -344,18 +390,18 @@ def process_batch(
             if stress_mode == "drop":
                 phoneme_str = phoneme_str.replace(PRIMARY_STRESS, "").replace(SECONDARY_STRESS, "")
             
-            # 1. 拆分成细粒度的 IPA 音素
+            # 第一要求：按最细粒度的 espeak-ng 单位将音素切开，并且全用空格连接。
+            # "不要 _" 说明直接把空格当成分隔符处理，不在里面混入 _。单词内部音素用空格隔开，单词之间也自然会有一个空格（其实在 token 化时，原始的单词间的空格也会作为一个 token 处理或丢弃，这里我们保留它作为一个独立的空格音素或者直接连续空格分隔）。
+            # 为了让 NeMo 输出有明显边界，且不使用 _, 这里有个很巧的办法：我们将原先单词级别的空格（espeak-ng 输出里的空格），直接变成一个普通的空格 token 存入 vocab。
+            # NeMo IPASymbolTokenizer 默认 split() 会吃掉所有空格，所以如果单纯只是 ` ` 会被 split 忽略掉。
+            # 那么怎样让 NeMo 学会预测空格，又不用 `_` 呢？只能使用另一个合法的非可见字符或者普通字符。
+            # 根据用户要求：“每个最小音标单位是有空格分隔的 ... 现在只是不要 _”、“vocab.txt 里面涉及到的音素必须是 espeak-ng 里面的最小单位”。
+            # 如果仅仅是不用 "_"，可以尝试在预处理端把每个最小音素拆开就行，因为 espeak-ng 里面的最小单位（音标）被切分出来之后用空格连接。原来单词之间的空格可以直接过滤掉，因为后处理的时候可以用我写的那个 Viterbi 根据 grapheme 中的空格补回来。
+            # 等等，如果直接丢弃原句中的空格，CTC 时 target_len 还会超出 grapheme_len（如果一个字母被发解成多个音素），所以这个问题还是有的。
+            
+            # 让它变成纯净的：只要 espeak-ng 的最小音素，用空格隔开。如果原来里面有空格（单词分界），我们也把它去掉（因为我们在 g2p_nemo_client.py 里用 viterbi 还原单词边界）。
             tokens = longest_match_tokenize(phoneme_str, candidate_multi_sorted)
-            
-            # 2. 将单词之间的空格替换为特殊的占位符 (U+2581)，使其能够作为一个独立的 token 被 NeMo 切分
-            processed_tokens = []
-            for tok in tokens:
-                if tok == " ":
-                    processed_tokens.append(WORD_BOUNDARY)
-                else:
-                    processed_tokens.append(tok)
-            
-            # 3. 使用空格连接所有 token，以便 NeMo 的 IPASymbolTokenizer 能够通过 split() 正常读取
+            processed_tokens = [tok for tok in tokens if tok != " "]
             results[src_idx] = (src_grapheme, " ".join(processed_tokens))
 
     return results
@@ -414,7 +460,6 @@ def main() -> None:
     else:
         est_batches = None
 
-    candidate_multi_sorted = tuple(sorted(DEFAULT_EN_US_ESPEAK_IPA_TOKENS, key=lambda x: (-len(x), x)))
     phoneme_counter: Counter = Counter()
     grapheme_counter: Counter = Counter()
     processed_rows = 0
@@ -473,7 +518,7 @@ def main() -> None:
                         continue
                     manifest_buffer.append(json.dumps({"text_graphemes": text, "text": phoneme_text}, ensure_ascii=False))
                     grapheme_counter.update(text)
-                    # phoneme_text 已经是被空格分隔好的细粒度 token（含占位符），直接 split 统计即可
+                    # phoneme_text 已经是被空格分隔好的细粒度 token，直接 split 统计即可
                     phoneme_counter.update(phoneme_text.split())
                     processed_rows += 1
                     if len(manifest_buffer) >= MANIFEST_WRITE_BUFFER_LINES:
