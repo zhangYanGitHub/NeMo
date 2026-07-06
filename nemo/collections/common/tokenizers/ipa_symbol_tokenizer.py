@@ -3,12 +3,24 @@ from __future__ import annotations
 import unicodedata
 from typing import Dict, Iterable, List, Optional, Sequence
 
+# Word-boundary token. The manifest ``text`` field (and the model's decoded output) is
+# "phonemes concatenated within a word, single space between words" — e.g. "bˈɔɪ hˈaʊs".
+# A literal space is used as the boundary token so that tokens_to_text() is just a plain
+# concatenation and naturally reproduces that exact format. It MUST therefore be present as
+# a real entry in vocab.txt (the preprocessing script writes it). NOTE: because it is a bare
+# space, be careful not to let editors/tools strip trailing whitespace from that vocab line.
+SPACE_TOKEN = " "
+
 
 class IPASymbolTokenizer:
-    """Lookup-table tokenizer over pre-segmented IPA units.
+    """Lookup-table tokenizer over IPA phoneme atoms with word-internal longest-match.
 
-    该实现与 tng2p 的 tokenizer 思路一致：边界由上游 espeak-ng 预处理决定，
-    tokenizer 只负责将空格分隔的 token 映射为 id。
+    Input ``text`` is word-internally concatenated with single spaces between words
+    ("bˈɔɪ hˈaʊs"). text_to_tokens() splits on spaces, greedily longest-matches each word
+    against the vocab into atomic phoneme tokens (diphthongs/affricates/length-marked vowels
+    are single vocab entries, so they stay atomic), and inserts SPACE_TOKEN between words.
+    tokens_to_text() concatenates tokens, so SPACE_TOKEN reproduces the word boundary and
+    word-internal atoms are glued back together — round-tripping the original string.
     """
 
     def __init__(
@@ -106,7 +118,7 @@ class IPASymbolTokenizer:
         strip_text: bool,
         strict_inventory_check: bool,
     ) -> None:
-        del strict_inventory_check  # kept for config backward-compat
+        del strict_inventory_check  # accepted for config backward-compat; no longer used
         self.vocab_file = vocab_file
         self.unk_token = unk_token
         self.pad_token = pad_token
@@ -132,6 +144,13 @@ class IPASymbolTokenizer:
         self.blank_id = None
         self.all_special_tokens = [pad_token, unk_token]
         self.special_token_set = {pad_token, unk_token}
+        self.has_space_token = SPACE_TOKEN in self.token2id
+        # Longest word-internal match only needs to consider real (non-special) tokens; cap
+        # the candidate length at the longest such token so text_to_tokens() stays O(len*max).
+        self._max_token_len = max(
+            (len(t) for t in vocab if t not in self.special_token_set and t != SPACE_TOKEN),
+            default=1,
+        )
         # NeMo 部分路径会访问 tokenizer.tokenizer
         self.tokenizer = self
 
@@ -165,12 +184,44 @@ class IPASymbolTokenizer:
             text = text.strip()
         return text
 
+    def _segment_word(self, word: str) -> List[str]:
+        """Greedy longest-match a single (space-free) word into vocab phoneme atoms.
+        Multi-codepoint atoms (diphthongs/affricates/length-marked vowels, stress-prefixed
+        variants, ...) win over their prefixes because we try longer candidates first. A
+        position that matches nothing falls back to a single character, which token_to_id()
+        will map to <unk>."""
+        tokens: List[str] = []
+        i, n = 0, len(word)
+        while i < n:
+            matched: Optional[str] = None
+            hi = min(self._max_token_len, n - i)
+            for length in range(hi, 0, -1):
+                cand = word[i : i + length]
+                if cand in self.token2id and cand not in self.special_token_set:
+                    matched = cand
+                    break
+            if matched is None:
+                tokens.append(word[i])
+                i += 1
+            else:
+                tokens.append(matched)
+                i += len(matched)
+        return tokens
+
     def text_to_tokens(self, text: str) -> List[str]:
-        return text.split()
+        # Words are space-separated; within a word phonemes are concatenated (no separators),
+        # so split on spaces, longest-match each word, and re-insert SPACE_TOKEN between words.
+        tokens: List[str] = []
+        for word_idx, word in enumerate(text.split()):
+            if word_idx > 0:
+                tokens.append(SPACE_TOKEN)
+            tokens.extend(self._segment_word(word))
+        return tokens
 
     def tokens_to_text(self, tokens: Iterable[str]) -> str:
-        toks = [t for t in tokens if t not in self.special_token_set]
-        return " ".join(toks)
+        # SPACE_TOKEN carries the word boundary and word-internal atoms are glued back
+        # together, so a plain concatenation reproduces "phonemes-within-word, space-between".
+        return "".join(t for t in tokens if t not in self.special_token_set)
 
     def tokens_to_ids(self, tokens: Iterable[str]) -> List[int]:
         t2i = self.token2id

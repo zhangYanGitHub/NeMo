@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "Per-voice (espeak-ng voice code, e.g. 'en-us') whitelist of multi-codepoint IPA",
+    "phoneme atoms that must NOT be split by tokenize_phoneme_word()'s longest-match",
+    "algorithm -- diphthongs, affricates, and any other multi-character unit that is",
+    "NOT expressible as 'base char + combining mark' (length marks, nasalization, etc.",
+    "are already handled generically by is_attaching() and never need to be listed here).",
+    "",
+    "To add a new language: add a new '<voice-code>': [...] entry below. Do NOT edit",
+    "preprocess_ipa_childes_split.py -- the longest-match algorithm is language-agnostic,",
+    "only this data file is language-specific. Voice codes are matched exactly first",
+    "(normalized to lowercase with '_' -> '-'), then fall back to the part before the",
+    "first '-' (e.g. an unlisted 'en-gb' falls back to 'en'). If a voice has no match at",
+    "all, tokenize_phoneme_word() still works correctly for it -- it just won't merge any",
+    "language-specific multi-character atoms beyond the generic combining-mark rule.",
+    "",
+    "These atoms decide which multi-codepoint units become single entries in the phoneme",
+    "vocab.txt, which is exactly what IPASymbolTokenizer's longest-match text_to_tokens()",
+    "uses to re-derive atomic tokens from the concatenated word strings at train time."
+  ],
+  "en-us": ["aɪ", "eɪ", "ɔɪ", "aʊ", "oʊ", "dʒ", "tʃ"]
+}
