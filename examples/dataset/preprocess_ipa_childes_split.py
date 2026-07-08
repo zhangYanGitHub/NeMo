@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Sequence, Tuple
 
 from piper_phonemize import phonemize_espeak  # type: ignore[reportMissingImports]
-from text_normalize import normalize_for_g2p, normalize_for_g2p_phonemize
+from text_normalize import normalize_for_g2p
 from tqdm import tqdm
 
 ZWJ = "\u200d"
@@ -362,11 +362,9 @@ def iter_csv_rows(
 ) -> Iterator[Tuple[str, str, str]]:
     """Yield ``(lang, grapheme_text, phonemize_text)`` triples.
 
-    *grapheme_text* is the model's input (clean TN, no digits).
-    *phonemize_text* is fed to piper/espeak; for digit+letter-A tokens it uses
-    the "A-" form (via :func:`normalize_for_g2p_phonemize`) so that espeak reads
-    the letter "A" as a letter name (ˈeɪ) instead of the indefinite article (ɐ).
-    For all other tokens the two texts are identical.
+    *grapheme_text* is the model's input (clean TN, no digits) and
+    *phonemize_text* (fed to piper/espeak) are identical: the same normalized
+    text goes to both, so training input and phoneme target stay in lockstep.
     """
     seen = 0
     with csv_path.open("r", encoding="utf-8", newline="") as f:
@@ -389,25 +387,19 @@ def iter_csv_rows(
                 continue
             lang = row[lang_idx].strip() if lang_idx < len(row) else ""
 
-            if normalize_nums:
-                grapheme = normalize_for_g2p(raw)
-                ph_text = normalize_for_g2p_phonemize(raw)
-            else:
-                grapheme = raw
-                ph_text = raw
+            # Grapheme input and phonemize input are the same normalized text
+            # (no letter-"A" / "A-" special-casing): the model sees exactly the
+            # text espeak phonemizes into the target.
+            text = normalize_for_g2p(raw) if normalize_nums else raw
 
             if split_punct:
-                grapheme_segs = split_into_segments(grapheme)
-                # phonemize_text may differ only in "A-" vs "A"; punctuation
-                # positions are identical, so we can segment both the same way.
-                ph_segs = split_into_segments(ph_text)
-                segment_pairs = list(zip(grapheme_segs, ph_segs))
+                segs = split_into_segments(text)
+                segment_pairs = [(seg, seg) for seg in segs]
             elif strip_punct:
-                g_seg = strip_punctuation(grapheme)
-                p_seg = strip_punctuation(ph_text)
-                segment_pairs = [(g_seg, p_seg)] if g_seg else []
+                seg = strip_punctuation(text)
+                segment_pairs = [(seg, seg)] if seg else []
             else:
-                segment_pairs = [(grapheme, ph_text)]
+                segment_pairs = [(text, text)]
 
             for g_seg, p_seg in segment_pairs:
                 if g_seg:

@@ -100,15 +100,16 @@ _ORDINAL_RE = re.compile(r"^(\d+)(st|nd|rd|th)$", re.IGNORECASE)
 _RUN_RE = re.compile(r"\d+|[^\d]+")
 
 
-def _transform_token(token: str, for_phonemize: bool = False) -> str:
+def _transform_token(token: str) -> str:
     """Transform a single whitespace-delimited token that contains >=1 digit.
+
+    Tokens are only ever rewritten into their genuine spoken form (digits/ordinals
+    expanded, code hyphens treated as separators). We never inject characters to
+    steer espeak toward a different phoneme (e.g. no "A" -> "A-" letter-name trick),
+    so espeak's phoneme output is whatever it produces for the real text.
 
     Args:
         token: the raw token (e.g. "2A", "101A", "I-95").
-        for_phonemize: when True, single-uppercase-letter suffix "A" is
-            rendered as "A-" so that piper/espeak reads it as the letter name
-            (ˈeɪ) rather than the indefinite article (ɐ).  All other letters
-            are unaffected because only "A" is genuinely ambiguous.
     """
     # Hyphen acts as a separator inside codes: US-101 -> "US 101", I-5 -> "I 5".
     parts = token.split("-")
@@ -126,14 +127,7 @@ def _transform_token(token: str, for_phonemize: bool = False) -> str:
             if run.isdigit():
                 pieces.append(int_to_words(int(run)))
             else:
-                # When building the phonemize text, a bare uppercase "A" that
-                # immediately follows a digit expansion (e.g. "2A" -> "two A")
-                # would be misread by espeak as the indefinite article.
-                # Appending "-" forces letter-name pronunciation.
-                if for_phonemize and run == "A":
-                    pieces.append("A-")
-                else:
-                    pieces.append(run)
+                pieces.append(run)
         out_parts.append(" ".join(pieces))
     return " ".join(out_parts)
 
@@ -175,19 +169,20 @@ def normalize_hyphens(text: str) -> str:
     return _ALPHA_HYPHEN_RE.sub(_split_hyphen_compound, text)
 
 
-def normalize_for_g2p(text: str, for_phonemize: bool = False) -> str:
+def normalize_for_g2p(text: str) -> str:
     """Expand digits/codes to spoken words so nothing is dropped by the digit-free
     grapheme vocab, and normalize alphabetic hyphen compounds (off-road -> off road).
     Only tokens containing a digit are number-expanded; everything else is preserved
     verbatim. Whitespace is collapsed.
 
+    The SAME normalized text is used for both the grapheme (model) input and the
+    espeak phonemize input. This is pure front-end text processing: it only rewrites
+    text into its genuine spoken form and never injects characters to change espeak's
+    phoneme output (no "A" -> "A-" letter-name trick), so espeak's phonemes are left
+    exactly as produced for the real text.
+
     Args:
         text: raw input text.
-        for_phonemize: pass True when the output will be fed to piper/espeak rather
-            than used as grapheme input for the G2P model.  This adds a "-" suffix
-            to uppercase "A" that originated from a digit+letter token so that
-            espeak reads it as the letter name (ˈeɪ) rather than the indefinite
-            article (ɐ).  Has no effect on tokens that are purely alphabetic.
     """
     if not text:
         return text
@@ -199,21 +194,9 @@ def normalize_for_g2p(text: str, for_phonemize: bool = False) -> str:
 
     def repl(m: re.Match) -> str:
         tok = m.group(0)
-        return _transform_token(tok, for_phonemize=for_phonemize) if any(ch.isdigit() for ch in tok) else tok
+        return _transform_token(tok) if any(ch.isdigit() for ch in tok) else tok
 
     return " ".join(_TOKEN_RE.sub(repl, text).split())
-
-
-def normalize_for_g2p_phonemize(text: str) -> str:
-    """Like :func:`normalize_for_g2p` but for the phonemize input path.
-
-    Identical to ``normalize_for_g2p(text, for_phonemize=True)``: digit+letter-A
-    tokens (e.g. "2A") are expanded with a trailing hyphen on the letter
-    ("two A-") so that piper/espeak reads "A" as a letter name, not an article.
-    Use this function when building the text that will be phonemized; use the
-    plain :func:`normalize_for_g2p` for the grapheme input to the G2P model.
-    """
-    return normalize_for_g2p(text, for_phonemize=True)
 
 
 def _verify() -> None:
