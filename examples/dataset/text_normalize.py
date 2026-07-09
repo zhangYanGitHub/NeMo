@@ -223,9 +223,13 @@ def _transform_token(token: str, locale: str = "en") -> str:
                 out_parts.append(ordinal_to_words(int(m.group(1))))
                 continue
         # Split into alternating digit / non-digit runs; expand digit runs only.
+        # isdecimal() (not isdigit()): only decimal digits [0-9]/Unicode Nd are int()-parseable
+        # cardinals. isdigit() also returns True for superscripts/subscripts (², ³, ₁), which
+        # _RUN_RE's \d does NOT match, so they land in a non-digit run yet would falsely pass an
+        # isdigit() check and crash int() (e.g. "km²"). Non-decimal runs pass through verbatim.
         pieces: List[str] = []
         for run in _RUN_RE.findall(part):
-            if run.isdigit():
+            if run.isdecimal():
                 pieces.append(_cardinal(int(run), locale))
             else:
                 pieces.append(run)
