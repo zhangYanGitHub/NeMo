@@ -14,6 +14,13 @@ CONTRACT (do not break)
       2. the inference frontend (call normalize_for_g2p() on the text before G2P)
     so the model sees the same spoken form at train and serve time.
 
+LOCALE
+    ``normalize_for_g2p(text, locale=...)`` selects the language's spell-out rules
+    (``'en'`` cardinals+ordinals, ``'de'`` German cardinals). The locale is wired from
+    lang_config.json's per-language ``number_locale`` and MUST match between train and
+    serve. The SCOPE notes below describe the English (``'en'``) rules; German adds
+    standard closed-form cardinals (einundzwanzig, dreihundertfünfundvierzig, ...).
+
 SCOPE (deliberately conservative)
     * integers           -> cardinal words   ("500" -> "five hundred")
     * ordinals "<n>th"   -> ordinal words     ("45th" -> "forty fifth")
@@ -95,12 +102,99 @@ def ordinal_to_words(n: int) -> str:
     return " ".join(words)
 
 
+# ---------------------------------------------------------------------------
+# German (de) cardinals
+# ---------------------------------------------------------------------------
+# German writes numbers below a million as a SINGLE closed word ("einundzwanzig",
+# "dreihundertfünfundvierzig"), units-before-tens joined by "und". We spell out the
+# standard German word form; espeak-ng 'de' then phonemizes that word normally. (We do
+# NOT try to reproduce espeak's own idiosyncratic digit reading, which splits numbers
+# into space-separated chunks -- the SAME normalized text is fed to both the grapheme
+# input and espeak, so the target stays aligned with whatever the German word is.)
+#
+# Irregular stems: sechzehn/sechzig (not sechs-), siebzehn/siebzig (not sieben-),
+# dreißig (ß). "ein" is the combining form (einundzwanzig, einhundert, eintausend);
+# a bare, sentence-final 1 is "eins" (see the *final* flag below).
+_DE_ONES = [
+    "null", "ein", "zwei", "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun",
+    "zehn", "elf", "zwölf", "dreizehn", "vierzehn", "fünfzehn", "sechzehn", "siebzehn",
+    "achtzehn", "neunzehn",
+]
+_DE_TENS = ["", "", "zwanzig", "dreißig", "vierzig", "fünfzig", "sechzig", "siebzig", "achtzig", "neunzig"]
+# Scale words are separate, feminine nouns (eine Million / zwei Millionen).
+_DE_SCALES = [(10 ** 9, "Milliarde", "Milliarden"), (10 ** 6, "Million", "Millionen")]
+
+
+def _de_below_100(n: int, final: bool) -> str:
+    """0..99 as one German word. *final* True -> a bare 1 reads 'eins', else 'ein'."""
+    if n < 20:
+        if n == 1:
+            return "eins" if final else "ein"
+        return _DE_ONES[n]
+    tens, ones = divmod(n, 10)
+    if ones == 0:
+        return _DE_TENS[tens]
+    # units-before-tens joined by "und": 21 -> einundzwanzig, 45 -> fünfundvierzig.
+    return f"{_DE_ONES[ones]}und{_DE_TENS[tens]}"
+
+
+def _de_below_1000(n: int, final: bool) -> str:
+    if n < 100:
+        return _de_below_100(n, final)
+    hundreds, rem = divmod(n, 100)
+    # hundreds multiplier: 1 -> "ein" (einhundert), never "eins".
+    out = _DE_ONES[hundreds] + "hundert"
+    if rem:
+        out += _de_below_100(rem, final)
+    return out
+
+
+def _de_below_million(n: int, final: bool) -> str:
+    if n < 1000:
+        return _de_below_1000(n, final)
+    thousands, rem = divmod(n, 1000)
+    # thousands multiplier is never sentence-final -> 1 stays "ein" (eintausend).
+    out = _de_below_1000(thousands, final=False) + "tausend"
+    if rem:
+        out += _de_below_1000(rem, final)
+    return out
+
+
+def int_to_words_de(n: int) -> str:
+    """Non-negative integer -> German cardinal words. 21 -> 'einundzwanzig',
+    345 -> 'dreihundertfünfundvierzig', 1000000 -> 'eine Million'."""
+    if n < 0:
+        return "minus " + int_to_words_de(-n)
+    if n == 0:
+        return "null"
+    parts: List[str] = []
+    for value, sing, plur in _DE_SCALES:
+        if n >= value:
+            count, n = divmod(n, value)
+            if count == 1:
+                parts.append("eine " + sing)
+            else:
+                parts.append(_de_below_million(count, final=False) + " " + plur)
+    if n > 0:
+        parts.append(_de_below_million(n, final=True))
+    return " ".join(parts)
+
+
+# Cardinal spell-out dispatch by number-normalization locale (see lang_config.json's
+# 'number_locale'). Unknown locales fall back to English so nothing crashes.
+_CARDINALS = {"en": int_to_words, "de": int_to_words_de}
+
+
+def _cardinal(n: int, locale: str) -> str:
+    return _CARDINALS.get(locale, int_to_words)(n)
+
+
 _TOKEN_RE = re.compile(r"\S+")
 _ORDINAL_RE = re.compile(r"^(\d+)(st|nd|rd|th)$", re.IGNORECASE)
 _RUN_RE = re.compile(r"\d+|[^\d]+")
 
 
-def _transform_token(token: str) -> str:
+def _transform_token(token: str, locale: str = "en") -> str:
     """Transform a single whitespace-delimited token that contains >=1 digit.
 
     Tokens are only ever rewritten into their genuine spoken form (digits/ordinals
@@ -108,8 +202,14 @@ def _transform_token(token: str) -> str:
     steer espeak toward a different phoneme (e.g. no "A" -> "A-" letter-name trick),
     so espeak's phoneme output is whatever it produces for the real text.
 
+    The English "<n>th/st/nd/rd" ordinal suffix is unambiguous and expanded here; German
+    ordinals are written "<n>." (a trailing period indistinguishable from a sentence dot,
+    and stripped by the punctuation pipeline anyway), so for locale != 'en' we only expand
+    cardinals -- the safe, unambiguous transformation.
+
     Args:
         token: the raw token (e.g. "2A", "101A", "I-95").
+        locale: number-normalization locale ('en', 'de', ...).
     """
     # Hyphen acts as a separator inside codes: US-101 -> "US 101", I-5 -> "I 5".
     parts = token.split("-")
@@ -117,15 +217,16 @@ def _transform_token(token: str) -> str:
     for part in parts:
         if not part:
             continue
-        m = _ORDINAL_RE.match(part)
-        if m:
-            out_parts.append(ordinal_to_words(int(m.group(1))))
-            continue
+        if locale == "en":
+            m = _ORDINAL_RE.match(part)
+            if m:
+                out_parts.append(ordinal_to_words(int(m.group(1))))
+                continue
         # Split into alternating digit / non-digit runs; expand digit runs only.
         pieces: List[str] = []
         for run in _RUN_RE.findall(part):
             if run.isdigit():
-                pieces.append(int_to_words(int(run)))
+                pieces.append(_cardinal(int(run), locale))
             else:
                 pieces.append(run)
         out_parts.append(" ".join(pieces))
@@ -169,7 +270,7 @@ def normalize_hyphens(text: str) -> str:
     return _ALPHA_HYPHEN_RE.sub(_split_hyphen_compound, text)
 
 
-def normalize_for_g2p(text: str) -> str:
+def normalize_for_g2p(text: str, locale: str = "en") -> str:
     """Expand digits/codes to spoken words so nothing is dropped by the digit-free
     grapheme vocab, and normalize alphabetic hyphen compounds (off-road -> off road).
     Only tokens containing a digit are number-expanded; everything else is preserved
@@ -183,6 +284,9 @@ def normalize_for_g2p(text: str) -> str:
 
     Args:
         text: raw input text.
+        locale: number-normalization locale selecting the spell-out rules ('en', 'de').
+            Wired from lang_config.json's per-language 'number_locale'. MUST match the
+            inference frontend for the language being served.
     """
     if not text:
         return text
@@ -194,38 +298,58 @@ def normalize_for_g2p(text: str) -> str:
 
     def repl(m: re.Match) -> str:
         tok = m.group(0)
-        return _transform_token(tok) if any(ch.isdigit() for ch in tok) else tok
+        return _transform_token(tok, locale) if any(ch.isdigit() for ch in tok) else tok
 
     return " ".join(_TOKEN_RE.sub(repl, text).split())
 
 
-def _verify() -> None:
-    """Compare TN+phonemize against raw phonemize to confirm/tune readings.
-    Requires piper_phonemize (present on the training machine)."""
+_VERIFY_CASES = {
+    "en": (
+        "en-us",
+        [
+            # number / code rules
+            "B15", "221B Baker Street", "US-101", "I-5", "M25",
+            "In 500 meters turn right", "exit 45th street", "1024",
+            # hyphen rule by English category: compound modifier, prefix, spelled number,
+            # then single-letter (letter-name) which must KEEP the hyphen
+            "a well-known high-speed route", "a non-stop anti-lock test",
+            "twenty-five north-bound lanes", "take a U-turn", "an A-frame and an e-mail",
+        ],
+    ),
+    "de": (
+        "de",
+        [
+            # cardinals across every scale boundary (units-und-tens, hundreds, thousands, Mio.)
+            "0", "1", "7", "16", "21", "45", "100", "101", "345", "500", "1024",
+            "In 500 Metern rechts abbiegen", "B15", "US-101",
+        ],
+    ),
+}
+
+
+def _verify(locale: str = "en") -> None:
+    """Spell numbers out and phonemize both the raw and normalized text so a human can
+    confirm/tune the readings for *locale*. Requires piper_phonemize (present on the
+    training machine). Note: German numbers deliberately do NOT byte-match espeak's own
+    digit reading (espeak splits them into space-separated chunks); the pipeline feeds the
+    spelled-out word to both grapheme input and espeak, so alignment is preserved."""
     try:
         from piper_phonemize import phonemize_espeak  # type: ignore[reportMissingImports]
     except Exception as exc:  # pragma: no cover - only runs where piper is installed
         print(f"piper_phonemize not available: {exc}")
         return
 
-    def ph(t: str) -> str:
-        return "".join("".join(s) for s in phonemize_espeak(t, "en-us"))
+    voice, cases = _VERIFY_CASES.get(locale, _VERIFY_CASES["en"])
 
-    cases = [
-        # number / code rules
-        "B15", "221B Baker Street", "US-101", "I-5", "M25",
-        "In 500 meters turn right", "exit 45th street", "1024",
-        # hyphen rule by English category: compound modifier, prefix, spelled number,
-        # then single-letter (letter-name) which must KEEP the hyphen
-        "a well-known high-speed route", "a non-stop anti-lock test",
-        "twenty-five north-bound lanes", "take a U-turn", "an A-frame and an e-mail",
-    ]
+    def ph(t: str) -> str:
+        return "".join("".join(s) for s in phonemize_espeak(t, voice))
+
     for raw in cases:
-        tn = normalize_for_g2p(raw)
+        tn = normalize_for_g2p(raw, locale=locale)
         same = ph(raw) == ph(tn)
         print(f"{raw!r:28} -> TN {tn!r}")
         print(f"     espeak(raw)= {ph(raw)!r}")
-        print(f"     espeak(tn) = {ph(tn)!r}   {'MATCH' if same else 'DIFF (tune rule)'}")
+        print(f"     espeak(tn) = {ph(tn)!r}   {'MATCH' if same else 'DIFF (expected for de numbers)'}")
         print()
 
 
@@ -234,11 +358,12 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description="G2P text normalization (numbers/codes).")
     ap.add_argument("--verify", action="store_true", help="probe against piper_phonemize")
+    ap.add_argument("--locale", default="en", help="number-normalization locale ('en', 'de')")
     ap.add_argument("text", nargs="*", help="normalize the given text and print")
     args = ap.parse_args()
     if args.verify:
-        _verify()
+        _verify(args.locale)
     elif args.text:
-        print(normalize_for_g2p(" ".join(args.text)))
+        print(normalize_for_g2p(" ".join(args.text), locale=args.locale))
     else:
         ap.print_help()

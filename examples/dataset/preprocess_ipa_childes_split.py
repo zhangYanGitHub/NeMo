@@ -27,32 +27,82 @@ LENGTH = "\u02d0"  # ː
 SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
 
-# Per-voice multi-character phoneme atom whitelists (diphthongs, affricates, ...) live in
-# phoneme_inventories.json, NOT here, so adding a new language never requires touching this
-# script -- only that data file. Long vowels (iː, uː, ...), nasalization, syllabicity etc. do
-# NOT need to be listed there at all: they're handled generically by is_attaching() below for
-# ANY language, since they're always "base char + combining mark" rather than two independent
-# base characters glued together (which is what genuinely needs a whitelist to disambiguate).
-DEFAULT_PHONEME_INVENTORIES_PATH = Path(__file__).with_name("phoneme_inventories.json")
+# EVERYTHING language-specific (espeak voice, number-normalization locale, the multi-character
+# phoneme atom whitelist, and the self-check regression cases) lives in lang_config.json, NOT
+# here, so adding / switching a language is a DATA change in that file -- this script stays
+# language-agnostic. Multi-character atoms are diphthongs/affricates/... that must survive the
+# longest-match tokenizer whole; long vowels (iː, uː, ...), nasalization, syllabicity etc. are
+# NOT listed there: they're "base char + combining mark" and handled generically by
+# is_attaching() below for ANY language.
+DEFAULT_LANG_CONFIG_PATH = Path(__file__).with_name("lang_config.json")
+
+
+class LanguageProfile:
+    """One language's worth of config from lang_config.json (see that file's _comment)."""
+
+    __slots__ = ("key", "voice", "number_locale", "multi_char_phonemes", "self_check")
+
+    def __init__(
+        self,
+        key: str,
+        voice: str,
+        number_locale: str,
+        multi_char_phonemes: Tuple[str, ...],
+        self_check: Dict[str, Tuple[str, List[str]]],
+    ) -> None:
+        self.key = key
+        self.voice = voice
+        self.number_locale = number_locale
+        self.multi_char_phonemes = multi_char_phonemes
+        self.self_check = self_check
 
 
 @functools.lru_cache(maxsize=None)
-def load_multi_char_phoneme_inventories(path: str) -> Dict[str, Tuple[str, ...]]:
-    """Load {voice_code: (atoms sorted longest-first)} from a phoneme_inventories.json-style
-    file. Cached per path so every worker process/thread only pays the (tiny) parse cost once.
-    Missing file -> empty mapping (every voice falls back to generic-only merging), so this is
-    never a hard requirement for the script to run."""
+def load_lang_config(path: str) -> Tuple[str, Dict[str, LanguageProfile]]:
+    """Load lang_config.json -> (default_language_key, {language_key: LanguageProfile}).
+    Cached per path so every worker process/thread only pays the (tiny) parse cost once."""
     p = Path(path)
     if not p.exists():
-        return {}
+        raise FileNotFoundError(
+            f"Language config not found: {p}. It holds the per-language voice / number locale / "
+            f"phoneme-atom whitelist / self-check cases and is required. See lang_config.json "
+            f"next to this script."
+        )
     with p.open("r", encoding="utf-8") as f:
         raw = json.load(f)
-    out: Dict[str, Tuple[str, ...]] = {}
-    for voice, atoms in raw.items():
-        if voice.startswith("_") or not isinstance(atoms, list):
-            continue  # e.g. the "_comment" key
-        out[normalize_voice(voice)] = tuple(sorted(set(atoms), key=len, reverse=True))
-    return out
+    languages = raw.get("languages", {})
+    if not isinstance(languages, dict) or not languages:
+        raise ValueError(f"lang_config.json {p} has no 'languages' map.")
+
+    profiles: Dict[str, LanguageProfile] = {}
+    for key, prof in languages.items():
+        if key.startswith("_") or not isinstance(prof, dict):
+            continue  # e.g. a "_comment" key
+        atoms = tuple(sorted(set(prof.get("multi_char_phonemes", [])), key=len, reverse=True))
+        self_check_raw = prof.get("self_check", {}) or {}
+        self_check = {word: (ipa, list(expected)) for word, (ipa, expected) in self_check_raw.items()}
+        profiles[normalize_voice(key)] = LanguageProfile(
+            key=normalize_voice(key),
+            voice=normalize_voice(prof.get("voice", key)),
+            number_locale=str(prof.get("number_locale", "en")).strip().lower(),
+            multi_char_phonemes=atoms,
+            self_check=self_check,
+        )
+
+    default_language = normalize_voice(raw.get("default_language") or next(iter(profiles)))
+    if default_language not in profiles:
+        raise ValueError(
+            f"lang_config.json default_language {default_language!r} is not one of the "
+            f"configured languages: {sorted(profiles)}"
+        )
+    return default_language, profiles
+
+
+def build_voice_inventories(profiles: Dict[str, LanguageProfile]) -> Dict[str, Tuple[str, ...]]:
+    """Collapse the language profiles into the {voice_code: (atoms longest-first)} map that
+    the per-row tokenizer looks up by espeak voice. Every configured language contributes its
+    voice, so a mixed-language CSV still tokenizes each row with the right atom whitelist."""
+    return {prof.voice: prof.multi_char_phonemes for prof in profiles.values()}
 
 
 def get_multi_char_phonemes_for_voice(voice: str, inventories: Dict[str, Tuple[str, ...]]) -> Tuple[str, ...]:
@@ -87,7 +137,7 @@ def tokenize_phoneme_word(
 ) -> List[str]:
     """Longest-match (maximal munch) tokenizer for a SINGLE word's espeak-ng IPA string
     against *multi_char_phonemes* (a language-specific whitelist, longest-first -- see
-    get_multi_char_phonemes_for_voice()/phoneme_inventories.json) plus generic
+    get_multi_char_phonemes_for_voice()/lang_config.json) plus generic
     combining-mark attachment (is_attaching(), language-agnostic). Returns one atomic
     phoneme unit per token, with stress marks folded into the unit they belong to
     (mode-dependent)."""
@@ -155,51 +205,41 @@ def phonemes_to_text_and_atoms(
     return " ".join(word_strs), atoms
 
 
-# Regression cases pinned against real piper_phonemize/espeak-ng en-us output. Guards against
-# the exact incident that once happened here: the (then hardcoded) multi-char atom whitelist
-# got silently overwritten with a flat single-character inventory, which decomposed "aɪ" ->
-# "a" + "ɪ" (and similarly for other diphthongs/affricates) and inflated phoneme token counts
-# enough to silently drop ~560k valid rows via the CTC T>=U length filter. run_self_check()
-# below turns any regression here -- whether in the code or in phoneme_inventories.json --
-# into an immediate, loud failure instead of a silent data loss only noticed after a full
-# preprocessing + training run.
-_SELF_CHECK_CASES = {
-    # word -> raw espeak-ng IPA -> expected tokenize_phoneme_word() output (stress_mode="attach")
-    "boy": ("bˈɔɪ", ["b", "ˈɔɪ"]),
-    "house": ("hˈaʊs", ["h", "ˈaʊ", "s"]),
-    "face": ("fˈeɪs", ["f", "ˈeɪ", "s"]),
-    "home": ("hˈoʊm", ["h", "ˈoʊ", "m"]),
-    "time": ("tˈaɪm", ["t", "ˈaɪ", "m"]),
-    "judge": ("dʒˈʌdʒ", ["dʒ", "ˈʌ", "dʒ"]),
-    "church": ("tʃˈɜːtʃ", ["tʃ", "ˈɜː", "tʃ"]),
-    "palmyra": ("pˈɑːmˈaɪɹə", ["p", "ˈɑː", "m", "ˈaɪ", "ɹ", "ə"]),
-}
+def run_self_check(profile: LanguageProfile) -> None:
+    """Assert tokenize_phoneme_word() still treats every diphthong/affricate in the ACTIVE
+    language's multi_char_phonemes whitelist (plus generic length-mark/combining-mark
+    attachment) as a single atomic unit, and that word-internal concatenation round-trips the
+    original word. Regression cases are pinned per language in lang_config.json's 'self_check'.
 
-
-def run_self_check(inventories: Dict[str, Tuple[str, ...]]) -> None:
-    """Assert tokenize_phoneme_word() still treats every known en-us diphthong/affricate
-    (loaded from phoneme_inventories.json, plus length-mark attachment) as a single atomic
-    unit, that word-internal concatenation round-trips the original word, and that
-    phonemes_to_text_and_atoms() emits the "concat-within-word, space-between-words" shape.
-    Fails loudly if phoneme_inventories.json no longer has a usable 'en-us' entry."""
-    en_us_atoms = get_multi_char_phonemes_for_voice("en-us", inventories)
-    if not en_us_atoms:
+    This guards against the exact incident that once happened here: the multi-char atom
+    whitelist got silently reduced to a flat single-character inventory, which decomposed "aɪ"
+    -> "a" + "ɪ" (and similarly for other diphthongs/affricates), inflating phoneme token
+    counts enough to silently drop huge amounts of valid rows via the CTC T>=U length filter.
+    Any regression -- in the code OR in lang_config.json -- fails loudly here instead of
+    surfacing as silent data loss only noticed after a full preprocessing + training run."""
+    atoms = profile.multi_char_phonemes
+    if not atoms:
         raise AssertionError(
-            "run_self_check: phoneme_inventories.json has no usable 'en-us' entry (got "
-            f"{en_us_atoms!r}). Check that the file exists next to this script and wasn't "
-            "accidentally emptied/renamed -- without it, diphthongs/affricates silently stop "
-            "being merged into atomic tokens for en-us data."
+            f"run_self_check: language {profile.key!r} (voice {profile.voice!r}) has an empty "
+            f"multi_char_phonemes whitelist in lang_config.json -- without it, diphthongs/"
+            f"affricates silently stop being merged into atomic tokens for this language."
         )
-    for word, (ipa, expected) in _SELF_CHECK_CASES.items():
-        got = tokenize_phoneme_word(ipa, multi_char_phonemes=en_us_atoms)
+    if not profile.self_check:
+        raise AssertionError(
+            f"run_self_check: language {profile.key!r} has no 'self_check' cases in "
+            f"lang_config.json; add a few word -> [ipa, expected-tokens] pins against real "
+            f"espeak-ng output so atom-merging regressions fail loudly."
+        )
+    for word, (ipa, expected) in profile.self_check.items():
+        got = tokenize_phoneme_word(ipa, multi_char_phonemes=atoms)
         if got != expected:
             raise AssertionError(
-                f"tokenize_phoneme_word regression for {word!r} (ipa={ipa!r}): "
-                f"got {got}, expected {expected}. phoneme_inventories.json's 'en-us' entry or "
-                f"is_attaching() was likely modified in a way that stops merging diphthongs/"
-                f"affricates/length marks into single atomic tokens -- this silently inflates "
-                f"phoneme token counts and can drop huge amounts of training data via the CTC "
-                f"T>=U filter. See the comment above _SELF_CHECK_CASES for the historical incident."
+                f"tokenize_phoneme_word regression for {word!r} (lang={profile.key!r}, "
+                f"ipa={ipa!r}): got {got}, expected {expected}. This language's "
+                f"multi_char_phonemes entry or is_attaching() was likely modified in a way that "
+                f"stops merging diphthongs/affricates/length marks into single atomic tokens -- "
+                f"this silently inflates phoneme token counts and can drop huge amounts of "
+                f"training data via the CTC T>=U filter."
             )
         # Word-internal concatenation must be loss-free (attach mode keeps stress in-string).
         if "".join(got) != ipa:
@@ -207,12 +247,16 @@ def run_self_check(inventories: Dict[str, Tuple[str, ...]]) -> None:
                 f"tokenize_phoneme_word is not round-trippable for {word!r}: "
                 f"''.join({got}) = {''.join(got)!r} != original {ipa!r}"
             )
-    # Full string: phonemes concatenated within a word, single space between words.
-    text, atoms = phonemes_to_text_and_atoms("bˈɔɪ hˈaʊs", multi_char_phonemes=en_us_atoms)
-    if text != "bˈɔɪ hˈaʊs":
-        raise AssertionError(f"phonemes_to_text_and_atoms text regression: got {text!r}, expected 'bˈɔɪ hˈaʊs'")
-    if atoms != ["b", "ˈɔɪ", "h", "ˈaʊ", "s"]:
-        raise AssertionError(f"phonemes_to_text_and_atoms atoms regression: got {atoms}")
+    # Full-string shape: phonemes concatenated within a word, single space between words.
+    pairs = list(profile.self_check.values())[:2]
+    if len(pairs) >= 2:
+        pair_str = f"{pairs[0][0]} {pairs[1][0]}"
+        text, _ = phonemes_to_text_and_atoms(pair_str, multi_char_phonemes=atoms)
+        if text != pair_str:
+            raise AssertionError(
+                f"phonemes_to_text_and_atoms text regression (lang={profile.key!r}): "
+                f"got {text!r}, expected {pair_str!r}"
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -227,16 +271,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True, help="output directory")
     parser.add_argument("--text-field", type=str, default="sentence", help="raw text column name")
     parser.add_argument("--lang-field", type=str, default="espeak_lang_code", help="espeak language code column name")
-    parser.add_argument("--default-voice", type=str, default="en-us", help="fallback voice when lang field is empty")
     parser.add_argument(
-        "--phoneme-inventories",
+        "--lang-config",
         type=Path,
-        default=DEFAULT_PHONEME_INVENTORIES_PATH,
+        default=DEFAULT_LANG_CONFIG_PATH,
         help=(
-            "JSON file mapping voice code -> list of multi-character IPA phoneme atoms "
-            "(diphthongs, affricates, ...) that must be kept atomic by the longest-match "
-            "tokenizer. Add a new language by adding an entry here, not by editing this "
-            "script. Defaults to phoneme_inventories.json next to this script."
+            "JSON file holding EVERYTHING language-specific: per-language espeak voice, "
+            "number-normalization locale, multi-character IPA phoneme-atom whitelist "
+            "(diphthongs/affricates kept atomic by the longest-match tokenizer), and the "
+            "self-check regression cases. Add / switch a language here, not by editing this "
+            "script. Defaults to lang_config.json next to this script."
+        ),
+    )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help=(
+            "Active language key in --lang-config (e.g. 'de', 'en-us'). Selects the default "
+            "voice, number-normalization locale, and the self-check cases. Defaults to the "
+            "config's 'default_language'."
+        ),
+    )
+    parser.add_argument(
+        "--default-voice",
+        type=str,
+        default=None,
+        help=(
+            "Fallback espeak voice for rows whose lang field is empty. Defaults to the active "
+            "language's 'voice' from --lang-config."
         ),
     )
     parser.add_argument("--workers", type=int, default=0, help="parallel workers; 0 means auto by CPU count")
@@ -359,6 +422,7 @@ def iter_csv_rows(
     strip_punct: bool = False,
     split_punct: bool = False,
     normalize_nums: bool = False,
+    number_locale: str = "en",
 ) -> Iterator[Tuple[str, str, str]]:
     """Yield ``(lang, grapheme_text, phonemize_text)`` triples.
 
@@ -390,7 +454,7 @@ def iter_csv_rows(
             # Grapheme input and phonemize input are the same normalized text
             # (no letter-"A" / "A-" special-casing): the model sees exactly the
             # text espeak phonemizes into the target.
-            text = normalize_for_g2p(raw) if normalize_nums else raw
+            text = normalize_for_g2p(raw, locale=number_locale) if normalize_nums else raw
 
             if split_punct:
                 segs = split_into_segments(text)
@@ -501,7 +565,7 @@ def process_batch(
 
     for voice, indexed_items in by_voice.items():
         # Language-specific multi-char atom whitelist (diphthongs/affricates/...), looked up
-        # per voice from phoneme_inventories.json -- adding a new language never touches this
+        # per voice from lang_config.json -- adding a new language never touches this
         # function. Unlisted voices still tokenize correctly via the generic combining-mark
         # rule alone (is_attaching()), just without any language-specific atom merging.
         multi_char_phonemes = get_multi_char_phonemes_for_voice(voice, inventories)
@@ -555,10 +619,23 @@ def main() -> None:
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    inventories_path = args.phoneme_inventories.expanduser().resolve()
-    inventories = load_multi_char_phoneme_inventories(str(inventories_path))
-    run_self_check(inventories)
-    print(f"Phoneme inventories: {inventories_path} (voices configured: {sorted(inventories) or 'none'})")
+    lang_config_path = args.lang_config.expanduser().resolve()
+    default_language, profiles = load_lang_config(str(lang_config_path))
+    language = normalize_voice(args.language) if args.language else default_language
+    if language not in profiles:
+        raise ValueError(
+            f"--language {language!r} is not configured in {lang_config_path}. "
+            f"Available languages: {sorted(profiles)}"
+        )
+    profile = profiles[language]
+    default_voice = normalize_voice(args.default_voice) if args.default_voice else profile.voice
+    inventories = build_voice_inventories(profiles)
+    run_self_check(profile)
+    print(
+        f"Language config: {lang_config_path} "
+        f"(languages: {sorted(profiles)}; active: {language!r}, "
+        f"voice: {profile.voice!r}, number locale: {profile.number_locale!r})"
+    )
 
     manifest_path = output_dir / args.manifest_name
     phoneme_vocab_path = output_dir / args.phoneme_vocab_name
@@ -607,6 +684,7 @@ def main() -> None:
             args.strip_punctuation,
             args.split_on_punctuation,
             args.normalize_numbers,
+            profile.number_locale,
         ),
         batch_size,
     )
@@ -617,7 +695,7 @@ def main() -> None:
                 executor,
                 max(1, workers * 2),
                 batch_iter,
-                args.default_voice,
+                default_voice,
                 args.stress,
                 effective_strip,
                 inventories,
