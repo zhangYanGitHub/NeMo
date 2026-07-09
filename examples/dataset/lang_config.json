@@ -26,10 +26,27 @@
     "                         real espeak-ng output; run_self_check() fails loudly on any",
     "                         regression (in the code OR in this file) that stops merging",
     "                         diphthongs/affricates/length-marks into single atomic tokens.",
+    "  'phoneme_inventory'  : AUTHORITATIVE set of single-codepoint base phones the language may",
+    "                         emit (stress ˈˌ / length ː / combining marks stripped before the",
+    "                         check). Together with multi_char_phonemes it is the metadata the",
+    "                         vocab is validated against: preprocess builds the phoneme vocab from",
+    "                         observed tokens but FAILS LOUDLY (build_voice_phone_sets +",
+    "                         atoms_are_in_language + the final vocab assertion) if any token's",
+    "                         base is not declared here. Rows espeak phonemizes with a language",
+    "                         switch ((en)…) or '?' are dropped and reported, never voc-added.",
+    "                         Empty list = no phoneme validation (backward compatible).",
+    "  'grapheme_inventory' : AUTHORITATIVE set of grapheme characters text_graphemes may contain.",
+    "                         The grapheme vocab is asserted to be a subset of this; anything else",
+    "                         (mojibake/CJK/symbols) is a data/config bug surfaced at generation,",
+    "                         not silently voc-added. MUST stay consistent with the data-cleaning",
+    "                         char_policy in prepare/config/<lang>/general_base_resources.json.",
+    "                         Empty = no grapheme validation (backward compatible).",
     "",
-    "German atoms/self_check derived from `espeak-ng`/`piper_phonemize` voice 'de':",
-    "  aɪ (mein), aʊ (Haus), ɔø (heute) are the diphthongs; pf (Pferd), ts (Zeit), tʃ",
-    "  (deutsch), dʒ (Dschungel) the affricates. ɔø (not ɔʏ) is what espeak-ng 'de' emits."
+    "German atoms/self_check/inventory derived from real `espeak-ng` voice 'de' over 20k clean",
+    "German words: aɪ (mein), aʊ (Haus), ɔø (heute) diphthongs; pf/ts/tʃ/dʒ affricates (ɔø not",
+    "ɔʏ is what espeak-ng 'de' emits). phoneme_inventory is the 41 base phones espeak-ng 'de'",
+    "actually produces; w/θ/ð/ɹ/ɒ/ʌ/nasal ɑ̃… are ENGLISH/FRENCH and intentionally absent so",
+    "language-switch contamination fails the check instead of leaking into the vocab."
   ],
   "default_language": "de",
   "languages": {
@@ -37,6 +54,11 @@
       "voice": "de",
       "number_locale": "de",
       "multi_char_phonemes": ["aɪ", "aʊ", "ɔø", "pf", "ts", "tʃ", "dʒ"],
+      "phoneme_inventory": [
+        "a", "ɑ", "e", "ɛ", "i", "ɪ", "o", "ɔ", "u", "ʊ", "y", "ʏ", "ø", "œ", "ə", "ɐ", "ɜ",
+        "p", "b", "t", "d", "k", "ɡ", "f", "v", "s", "z", "ʃ", "ʒ", "ç", "x", "h", "m", "n", "ŋ", "l", "r", "ɾ", "j"
+      ],
+      "grapheme_inventory": " '-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZßàáâãäåæçèéêëìíîïñòóôõöøùúûüýÿœÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÑÒÓÔÕÖØÙÚÛÜÝŸŒ",
       "self_check": {
         "mein": ["mˈaɪn", ["m", "ˈaɪ", "n"]],
         "Haus": ["hˈaʊs", ["h", "ˈaʊ", "s"]],

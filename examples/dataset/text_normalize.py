@@ -274,6 +274,38 @@ def normalize_hyphens(text: str) -> str:
     return _ALPHA_HYPHEN_RE.sub(_split_hyphen_compound, text)
 
 
+# 有读法的符号 → 词（在 strip 前展开，产出纯字母，绝不把符号漏进 text_graphemes）。
+# 通道说明：prepare 的 char_policy 在 CSV 阶段就丢掉了 € ° µ × ½ § 这类罕见符号，正常只有
+# allowed_punct 里的 % & + 会走到这里（+ 展开成 plus，覆盖电话前缀 +49→„plus 49“）；下面的
+# 完整映射是给「直接对任意 CSV 跑 preprocess」兜底，
+# 并与 lang_config.json 的 grapheme_inventory（纯字母）保持一致（符号全部变成词后就不越界）。
+_SYMBOLS = {
+    "de": {
+        "°C": " Grad Celsius ", "°F": " Grad Fahrenheit ", "°": " Grad ",
+        "%": " Prozent ", "‰": " Promille ", "&": " und ", "€": " Euro ", "$": " Dollar ",
+        "£": " Pfund ", "µ": " Mikro ", "×": " mal ", "±": " plus minus ", "+": " plus ",
+        "½": " einhalb ", "¼": " ein viertel ", "¾": " drei viertel ", "§": " Paragraf ",
+    },
+    "en": {
+        "°C": " degrees Celsius ", "°F": " degrees Fahrenheit ", "°": " degrees ",
+        "%": " percent ", "‰": " per mille ", "&": " and ", "€": " euro ", "$": " dollars ",
+        "£": " pounds ", "µ": " micro ", "×": " times ", "±": " plus minus ", "+": " plus ",
+        "½": " one half ", "¼": " one quarter ", "¾": " three quarters ", "§": " section ",
+    },
+}
+
+
+def _expand_symbols(text: str, locale: str) -> str:
+    """把有读法的符号替换成对应语言的词（多字符键如 '°C' 先于 '°'，故按键长降序替换）。"""
+    table = _SYMBOLS.get(locale, _SYMBOLS["en"])
+    if not any(sym in text for sym in table):
+        return text
+    for sym in sorted(table, key=len, reverse=True):
+        if sym in text:
+            text = text.replace(sym, table[sym])
+    return text
+
+
 def normalize_for_g2p(text: str, locale: str = "en") -> str:
     """Expand digits/codes to spoken words so nothing is dropped by the digit-free
     grapheme vocab, and normalize alphabetic hyphen compounds (off-road -> off road).
@@ -296,6 +328,7 @@ def normalize_for_g2p(text: str, locale: str = "en") -> str:
         return text
 
     text = normalize_hyphens(text)
+    text = _expand_symbols(text, locale)
 
     if not any(ch.isdigit() for ch in text):
         return " ".join(text.split())
@@ -333,20 +366,24 @@ _VERIFY_CASES = {
 
 def _verify(locale: str = "en") -> None:
     """Spell numbers out and phonemize both the raw and normalized text so a human can
-    confirm/tune the readings for *locale*. Requires piper_phonemize (present on the
-    training machine). Note: German numbers deliberately do NOT byte-match espeak's own
+    confirm/tune the readings for *locale*. Phonemizes via espeak-ng DIRECTLY (same backend
+    as preprocess_ipa_childes_split.py — NOT piper_phonemize — so what you verify equals what
+    the pipeline trains on). Note: German numbers deliberately do NOT byte-match espeak's own
     digit reading (espeak splits them into space-separated chunks); the pipeline feeds the
     spelled-out word to both grapheme input and espeak, so alignment is preserved."""
-    try:
-        from piper_phonemize import phonemize_espeak  # type: ignore[reportMissingImports]
-    except Exception as exc:  # pragma: no cover - only runs where piper is installed
-        print(f"piper_phonemize not available: {exc}")
+    import shutil
+    import subprocess
+
+    exe = shutil.which("espeak-ng") or shutil.which("espeak")
+    if not exe:
+        print("espeak-ng not available (apt-get install espeak-ng / brew install espeak-ng)")
         return
 
     voice, cases = _VERIFY_CASES.get(locale, _VERIFY_CASES["en"])
 
     def ph(t: str) -> str:
-        return "".join("".join(s) for s in phonemize_espeak(t, voice))
+        p = subprocess.run([exe, "-v", voice, "-q", "--ipa"], input=t, capture_output=True, text=True)
+        return p.stdout.strip().replace("\n", " ")
 
     for raw in cases:
         tn = normalize_for_g2p(raw, locale=locale)
@@ -361,7 +398,7 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description="G2P text normalization (numbers/codes).")
-    ap.add_argument("--verify", action="store_true", help="probe against piper_phonemize")
+    ap.add_argument("--verify", action="store_true", help="probe against espeak-ng --ipa directly")
     ap.add_argument("--locale", default="en", help="number-normalization locale ('en', 'de')")
     ap.add_argument("text", nargs="*", help="normalize the given text and print")
     args = ap.parse_args()

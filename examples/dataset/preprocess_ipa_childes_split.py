@@ -7,14 +7,15 @@ import functools
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unicodedata
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Dict, Iterator, List, Sequence, Tuple
+from typing import Dict, Iterator, List, Sequence, Set, Tuple
 
-from piper_phonemize import phonemize_espeak  # type: ignore[reportMissingImports]
 from text_normalize import normalize_for_g2p
 from tqdm import tqdm
 
@@ -40,7 +41,10 @@ DEFAULT_LANG_CONFIG_PATH = Path(__file__).with_name("lang_config.json")
 class LanguageProfile:
     """One language's worth of config from lang_config.json (see that file's _comment)."""
 
-    __slots__ = ("key", "voice", "number_locale", "multi_char_phonemes", "self_check")
+    __slots__ = (
+        "key", "voice", "number_locale", "multi_char_phonemes",
+        "self_check", "phoneme_inventory", "grapheme_inventory",
+    )
 
     def __init__(
         self,
@@ -49,12 +53,19 @@ class LanguageProfile:
         number_locale: str,
         multi_char_phonemes: Tuple[str, ...],
         self_check: Dict[str, Tuple[str, List[str]]],
+        phoneme_inventory: Tuple[str, ...] = (),
+        grapheme_inventory: frozenset = frozenset(),
     ) -> None:
         self.key = key
         self.voice = voice
         self.number_locale = number_locale
         self.multi_char_phonemes = multi_char_phonemes
         self.self_check = self_check
+        # 该语言允许出现的单音素基字符白名单（去除重音 ˈˌ / 长音 ː / 组合符后的基底）。
+        # 空 = 不做音素白名单校验（向后兼容）。见 build_voice_phone_sets()/atoms_are_in_language().
+        self.phoneme_inventory = phoneme_inventory
+        # 该语言 text_graphemes 允许出现的字素字符白名单。空 = 不校验（向后兼容）。
+        self.grapheme_inventory = grapheme_inventory
 
 
 @functools.lru_cache(maxsize=None)
@@ -87,6 +98,8 @@ def load_lang_config(path: str) -> Tuple[str, Dict[str, LanguageProfile]]:
             number_locale=str(prof.get("number_locale", "en")).strip().lower(),
             multi_char_phonemes=atoms,
             self_check=self_check,
+            phoneme_inventory=tuple(prof.get("phoneme_inventory", []) or []),
+            grapheme_inventory=frozenset("".join(prof.get("grapheme_inventory", "") or "")),
         )
 
     default_language = normalize_voice(raw.get("default_language") or next(iter(profiles)))
@@ -113,6 +126,70 @@ def get_multi_char_phonemes_for_voice(voice: str, inventories: Dict[str, Tuple[s
         return inventories[voice]
     lang = voice.split("-", 1)[0]
     return inventories.get(lang, ())
+
+
+def build_voice_phone_sets(profiles: Dict[str, LanguageProfile]) -> Dict[str, Set[str]]:
+    """{voice_code: set(allowed base phones)} —— 每语言的音素白名单（单音素基字符 ∪ 多字符原子）。
+    用于剔除混入的外语音素（如 espeak-ng 自动语言切换产出的英语 ɹ/w/θ 等）。空集合 = 不校验。"""
+    out: Dict[str, Set[str]] = {}
+    for prof in profiles.values():
+        if prof.phoneme_inventory:
+            out[prof.voice] = set(prof.phoneme_inventory) | set(prof.multi_char_phonemes)
+    return out
+
+
+def _atom_base(atom: str) -> str:
+    """去掉重音符 ˈˌ、长音符 ː 与组合符，得到音素基底，用于对照 phoneme_inventory。"""
+    return "".join(ch for ch in atom if ch not in STRESS and ch != LENGTH and unicodedata.combining(ch) == 0)
+
+
+def atoms_are_in_language(atoms: Sequence[str], allowed: Set[str]) -> bool:
+    """所有原子的基底都在该语言音素白名单内则 True。allowed 为空 → 不校验（True）。"""
+    if not allowed:
+        return True
+    for atom in atoms:
+        base = _atom_base(atom)
+        if base and base != SPACE_TOKEN and base not in allowed:
+            return False
+    return True
+
+
+def assert_vocab_within_inventory(
+    profile: "LanguageProfile", phoneme_counter: Counter, grapheme_counter: Counter
+) -> None:
+    """生成时对照元数据校验最终 vocab：音素 token 基底必须 ⊆ phoneme_inventory ∪ multi_char_phonemes，
+    字素必须 ⊆ grapheme_inventory。任何越界都是数据/逻辑 bug，直接报错并列出越界项+频次，
+    而不是把脏 token 塞进 vocab。inventory 为空则跳过（向后兼容）。"""
+    problems: List[str] = []
+    if profile.phoneme_inventory:
+        allowed = set(profile.phoneme_inventory) | set(profile.multi_char_phonemes)
+        bad = {}
+        for tok, cnt in phoneme_counter.items():
+            if tok == SPACE_TOKEN:
+                continue
+            base = _atom_base(tok)
+            if base and base not in allowed:
+                bad[tok] = cnt
+        if bad:
+            top = sorted(bad.items(), key=lambda kv: (-kv[1], kv[0]))[:40]
+            problems.append(
+                "音素 vocab 出现 phoneme_inventory 之外的 token（基底越界）：\n    "
+                + ", ".join(f"{t!r}(U+{'/'.join(f'{ord(c):04X}' for c in _atom_base(t))}, x{n})" for t, n in top)
+            )
+    if profile.grapheme_inventory:
+        bad_g = {ch: cnt for ch, cnt in grapheme_counter.items() if ch not in profile.grapheme_inventory}
+        if bad_g:
+            top = sorted(bad_g.items(), key=lambda kv: (-kv[1], kv[0]))[:60]
+            problems.append(
+                "字素 vocab 出现 grapheme_inventory 之外的字符：\n    "
+                + ", ".join(f"{c!r}(U+{ord(c):04X}, x{n})" for c, n in top)
+            )
+    if problems:
+        raise RuntimeError(
+            "Vocab 元数据校验失败——生成逻辑或输入数据把不该出现的符号带进了 vocab。\n"
+            "请修数据清洗（prepare 的 char_policy）/ 音素闸门 / 或在 lang_config.json 补声明，"
+            "而不是接受脏 vocab：\n- " + "\n- ".join(problems)
+        )
 
 
 # Word-boundary token. The manifest ``text`` field stores phonemes concatenated within a
@@ -397,21 +474,47 @@ def normalize_voice(voice: str) -> str:
     return voice.strip().lower().replace("_", "-")
 
 
-def run_phonemize(text: str, voice: str) -> str:
-    """Return piper/espeak IPA in word-level format: each word's phonemes
-    concatenated, words separated by a single space — identical to the
-    ``phoneme_lists_to_ipa`` helper in generate_g2p_manifest_espeak.py."""
-    phoneme_lists = phonemize_espeak(text, voice)
-    return "".join("".join(sentence) for sentence in phoneme_lists)
+# espeak-ng 直连（取代 piper_phonemize）。piper_phonemize 只是 espeak-ng 的 Python 封装，但它
+# 内置的 IPA 映射表缺德语 ɐ（元音化 r），会替换成 '?' 污染数据；直连 espeak-ng --ipa 则原样输出
+# ɐ，并把自动语言切换标成 '(en)...(de)'，让我们能精确识别并丢弃混入外语发音的行。
+# 训练/推理一致性：训练用什么后端，前端推理就必须用同一 espeak-ng 直连，切勿再回退 piper。
+@functools.lru_cache(maxsize=1)
+def _espeak_bin() -> str:
+    exe = os.environ.get("ESPEAK_NG_BIN") or shutil.which("espeak-ng") or shutil.which("espeak")
+    if not exe:
+        raise RuntimeError(
+            "espeak-ng not found. Install it (apt-get install espeak-ng / brew install espeak-ng) "
+            "or set $ESPEAK_NG_BIN. This preprocessor calls espeak-ng --ipa directly (no piper_phonemize)."
+        )
+    return exe
 
 
 def run_phonemize_batch(texts: Sequence[str], voice: str) -> List[str]:
+    """一次 espeak-ng 进程批量音素化整批文本。espeak-ng --ipa 对 stdin **逐行 1:1** 输出 IPA
+    （词内音素相连、词间单空格，即模型的目标形态）。空行会被 espeak 跳过导致错位，故先滤空、
+    音素化后按原索引对齐回填。返回的行可能含 '(en)' 语言切换标记或 '?'，交由调用方判定丢弃。"""
     if not texts:
         return []
-    out_lines: List[str] = []
-    for text in texts:
-        out_lines.append(run_phonemize(text, voice=voice).strip().replace("\n", " "))
-    return out_lines
+    out: List[str] = [""] * len(texts)
+    idx_nonempty = [i for i, t in enumerate(texts) if t and t.strip()]
+    if not idx_nonempty:
+        return out
+    payload = "\n".join(texts[i].replace("\n", " ").replace("\r", " ") for i in idx_nonempty)
+    proc = subprocess.run(
+        [_espeak_bin(), "-v", voice, "-q", "--ipa"],
+        input=payload,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"espeak-ng failed (voice={voice!r}, rc={proc.returncode}): {proc.stderr[:500]}")
+    lines = proc.stdout.split("\n")
+    if len(lines) < len(idx_nonempty):  # 对齐兜底：行数不足则补空，绝不错位
+        lines += [""] * (len(idx_nonempty) - len(lines))
+    for pos, src_idx in enumerate(idx_nonempty):
+        out[src_idx] = lines[pos].strip().replace("\n", " ")
+    return out
 
 
 def iter_csv_rows(
@@ -502,9 +605,11 @@ def ordered_process_batches(
     stress_mode: str,
     strip_punct: bool = False,
     inventories: Dict[str, Tuple[str, ...]] = None,
+    phone_sets: Dict[str, Set[str]] = None,
 ) -> Iterator[List[Tuple[str, str, List[str]]]]:
     """Like executor.map(process_batch, ...) but submit only max_in_flight tasks ahead; preserve order."""
     inventories = inventories or {}
+    phone_sets = phone_sets or {}
     it = enumerate(batches_iter)
     pending: dict = {}
     saved: dict[int, List[Tuple[str, str, List[str]]]] = {}
@@ -519,7 +624,9 @@ def ordered_process_batches(
             except StopIteration:
                 exhausted = True
                 return
-            fut = executor.submit(process_batch, batch, default_voice, stress_mode, strip_punct, inventories)
+            fut = executor.submit(
+                process_batch, batch, default_voice, stress_mode, strip_punct, inventories, phone_sets
+            )
             pending[fut] = idx
 
     def emit_ready() -> Iterator[List[Tuple[str, str, List[str]]]]:
@@ -547,14 +654,21 @@ def process_batch(
     stress_mode: str,
     strip_punct: bool = False,
     inventories: Dict[str, Tuple[str, ...]] = None,
+    phone_sets: Dict[str, Set[str]] = None,
 ) -> List[Tuple[str, str, List[str]]]:
     """Phonemize a batch of (lang, grapheme_text, phonemize_text) rows.
 
     Returns (grapheme_text, phoneme_text, atom_tokens) triples, where phoneme_text is the
     manifest ``text`` value (phonemes concatenated within a word, single space between words)
     and atom_tokens is the flat list of atomic phoneme units for building the phoneme vocab.
+
+    音素级净化闸门（保证 text 侧只含目标语言音素）：整行丢弃（回填空三元组，main 会跳过）当
+      * espeak-ng 输出含 '(' 语言切换标记（如 (en)…(de)）→ 该行含外语发音；
+      * 含 '?' → espeak 无法映射的符号；
+      * 任一原子基底不在该语言 phoneme_inventory 白名单内 → 混入的外语/杂音素。
     """
     inventories = inventories or {}
+    phone_sets = phone_sets or {}
     results: List[Tuple[str, str, List[str]]] = [("", "", [])] * len(batch_rows)
     by_voice: dict[str, List[Tuple[int, str, str]]] = {}
     for i, (lang, grapheme, ph_text) in enumerate(batch_rows):
@@ -569,10 +683,14 @@ def process_batch(
         # function. Unlisted voices still tokenize correctly via the generic combining-mark
         # rule alone (is_attaching()), just without any language-specific atom merging.
         multi_char_phonemes = get_multi_char_phonemes_for_voice(voice, inventories)
+        allowed_phones = phone_sets.get(voice) or phone_sets.get(voice.split("-", 1)[0]) or set()
         phon_texts = [pt for _, _, pt in indexed_items]
         ipa_lines = run_phonemize_batch(phon_texts, voice=voice)
         for (src_idx, src_grapheme, _), ipa_line in zip(indexed_items, ipa_lines):
             phoneme_str = ipa_line.strip()
+            # 语言切换 / 不可映射符号 → 丢弃（不学外语发音）。
+            if "(" in phoneme_str or "?" in phoneme_str:
+                continue
             if stress_mode == "drop":
                 phoneme_str = phoneme_str.replace(PRIMARY_STRESS, "").replace(SECONDARY_STRESS, "")
 
@@ -582,6 +700,9 @@ def process_batch(
             phoneme_text, atoms = phonemes_to_text_and_atoms(
                 phoneme_str, stress_mode=stress_mode, multi_char_phonemes=multi_char_phonemes
             )
+            # 音素白名单校验：任一原子越界（外语/杂音素）→ 丢弃整行。
+            if not atoms_are_in_language(atoms, allowed_phones):
+                continue
             results[src_idx] = (src_grapheme, phoneme_text, atoms)
 
     return results
@@ -630,6 +751,7 @@ def main() -> None:
     profile = profiles[language]
     default_voice = normalize_voice(args.default_voice) if args.default_voice else profile.voice
     inventories = build_voice_inventories(profiles)
+    phone_sets = build_voice_phone_sets(profiles)
     run_self_check(profile)
     print(
         f"Language config: {lang_config_path} "
@@ -661,6 +783,7 @@ def main() -> None:
     phoneme_counter: Counter = Counter()
     grapheme_counter: Counter = Counter()
     processed_rows = 0
+    seen_rows = 0  # 进入音素化的总行数（含被音素闸门丢弃的），用于报告丢弃率
     manifest_buffer: List[str] = []
 
     def flush_manifest_buffer(manifest_f) -> None:
@@ -699,6 +822,7 @@ def main() -> None:
                 args.stress,
                 effective_strip,
                 inventories,
+                phone_sets,
             )
             if args.show_progress:
                 ordered = tqdm(
@@ -714,6 +838,7 @@ def main() -> None:
 
             for processed in ordered:
                 for text, phoneme_text, atoms in processed:
+                    seen_rows += 1
                     if not text or not phoneme_text:
                         continue
                     manifest_buffer.append(json.dumps({"text_graphemes": text, "text": phoneme_text}, ensure_ascii=False))
@@ -733,6 +858,9 @@ def main() -> None:
         raise RuntimeError(f"No valid rows processed from {input_csv}")
 
     if args.write_vocab:
+        # 生成时按元数据校验：越界 token 直接报错（不产出脏 vocab）。见 lang_config.json 的
+        # phoneme_inventory / grapheme_inventory。
+        assert_vocab_within_inventory(profile, phoneme_counter, grapheme_counter)
         phoneme_tokens = [tok for tok, _ in sorted(phoneme_counter.items(), key=lambda kv: (-kv[1], kv[0]))]
         grapheme_tokens = sorted(grapheme_counter.keys())
         merged_tokens: List[str] = []
@@ -750,8 +878,14 @@ def main() -> None:
         write_vocab(grapheme_vocab_path, grapheme_tokens)
         write_vocab(merged_vocab_path, merged_tokens)
 
+    dropped_rows = seen_rows - processed_rows
+    drop_pct = (100.0 * dropped_rows / seen_rows) if seen_rows else 0.0
     print(f"Input CSV: {input_csv}")
     print(f"Processed rows: {processed_rows}")
+    print(
+        f"Phoneme-gate dropped rows: {dropped_rows} / {seen_rows} ({drop_pct:.2f}%) "
+        f"[espeak (en) language-switch / '?' / out-of-inventory phones]"
+    )
     print(
         f"CPU: {cpu_count}, workers: {workers}, executor: {args.executor}, "
         f"batch size: {batch_size}"
