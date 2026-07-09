@@ -1,0 +1,70 @@
+{
+  "_comment": [
+    "Single source of truth for everything LANGUAGE-SPECIFIC in preprocess_ipa_childes_split.py.",
+    "Adding / switching a language is a DATA change here, not a code change in the script.",
+    "",
+    "Top-level keys:",
+    "  'default_language' : language key used when --language is not passed on the CLI.",
+    "  'languages'        : map of <language-key> -> profile. The key is what you pass to",
+    "                       --language (e.g. 'de', 'en-us'); it does NOT have to equal the",
+    "                       espeak voice, that is the 'voice' field below.",
+    "",
+    "Per-language profile fields:",
+    "  'voice'              : espeak-ng voice code (e.g. 'de', 'en-us') used both as the",
+    "                         phonemizer voice and as the key for per-voice atom lookup on",
+    "                         rows whose CSV lang column matches it.",
+    "  'number_locale'      : which number->words rule set text_normalize.py applies when",
+    "                         --normalize-numbers is on ('de' or 'en'). Digits are dropped by",
+    "                         the digit-free grapheme vocab, so they must be spelled out.",
+    "  'multi_char_phonemes': whitelist of MULTI-codepoint espeak-ng IPA atoms that the",
+    "                         longest-match tokenizer must keep whole (diphthongs, affricates,",
+    "                         ...). These are derived from real espeak-ng output for the voice.",
+    "                         Long vowels (eː, uː, ...), nasalization, syllabicity etc. are NOT",
+    "                         listed here: they are 'base char + combining mark' and handled",
+    "                         generically by is_attaching() for every language.",
+    "  'self_check'         : word -> [raw espeak-ng IPA, expected token list]. Pinned against",
+    "                         real espeak-ng output; run_self_check() fails loudly on any",
+    "                         regression (in the code OR in this file) that stops merging",
+    "                         diphthongs/affricates/length-marks into single atomic tokens.",
+    "",
+    "German atoms/self_check derived from `espeak-ng`/`piper_phonemize` voice 'de':",
+    "  aɪ (mein), aʊ (Haus), ɔø (heute) are the diphthongs; pf (Pferd), ts (Zeit), tʃ",
+    "  (deutsch), dʒ (Dschungel) the affricates. ɔø (not ɔʏ) is what espeak-ng 'de' emits."
+  ],
+  "default_language": "de",
+  "languages": {
+    "de": {
+      "voice": "de",
+      "number_locale": "de",
+      "multi_char_phonemes": ["aɪ", "aʊ", "ɔø", "pf", "ts", "tʃ", "dʒ"],
+      "self_check": {
+        "mein": ["mˈaɪn", ["m", "ˈaɪ", "n"]],
+        "Haus": ["hˈaʊs", ["h", "ˈaʊ", "s"]],
+        "heute": ["hˈɔøtə", ["h", "ˈɔø", "t", "ə"]],
+        "Pferd": ["pfˈeːɾt", ["pf", "ˈeː", "ɾ", "t"]],
+        "Zeit": ["tsˈaɪt", ["ts", "ˈaɪ", "t"]],
+        "deutsch": ["dˈɔøtʃ", ["d", "ˈɔø", "tʃ"]],
+        "Dschungel": ["dʒˈʊŋəl", ["dʒ", "ˈʊ", "ŋ", "ə", "l"]],
+        "Buch": ["bˈuːx", ["b", "ˈuː", "x"]],
+        "Katze": ["kˈatsə", ["k", "ˈa", "ts", "ə"]],
+        "Apfel": ["ˈapfəl", ["ˈa", "pf", "ə", "l"]],
+        "schön": ["ʃˈøːn", ["ʃ", "ˈøː", "n"]]
+      }
+    },
+    "en-us": {
+      "voice": "en-us",
+      "number_locale": "en",
+      "multi_char_phonemes": ["aɪ", "eɪ", "ɔɪ", "aʊ", "oʊ", "dʒ", "tʃ"],
+      "self_check": {
+        "boy": ["bˈɔɪ", ["b", "ˈɔɪ"]],
+        "house": ["hˈaʊs", ["h", "ˈaʊ", "s"]],
+        "face": ["fˈeɪs", ["f", "ˈeɪ", "s"]],
+        "home": ["hˈoʊm", ["h", "ˈoʊ", "m"]],
+        "time": ["tˈaɪm", ["t", "ˈaɪ", "m"]],
+        "judge": ["dʒˈʌdʒ", ["dʒ", "ˈʌ", "dʒ"]],
+        "church": ["tʃˈɜːtʃ", ["tʃ", "ˈɜː", "tʃ"]],
+        "palmyra": ["pˈɑːmˈaɪɹə", ["p", "ˈɑː", "m", "ˈaɪ", "ɹ", "ə"]]
+      }
+    }
+  }
+}
