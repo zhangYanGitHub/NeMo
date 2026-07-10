@@ -7,8 +7,6 @@ import functools
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import unicodedata
 from collections import Counter
@@ -162,7 +160,8 @@ def assert_vocab_within_inventory(
     而不是把脏 token 塞进 vocab。inventory 为空则跳过（向后兼容）。"""
     problems: List[str] = []
     if profile.phoneme_inventory:
-        allowed = set(profile.phoneme_inventory) | set(profile.multi_char_phonemes)
+        # '?' 已按用户要求放开，视为合法音素 token，不计入越界。
+        allowed = set(profile.phoneme_inventory) | set(profile.multi_char_phonemes) | {UNMAPPED_MARK}
         bad = {}
         for tok, cnt in phoneme_counter.items():
             if tok == SPACE_TOKEN:
@@ -188,7 +187,7 @@ def assert_vocab_within_inventory(
         raise RuntimeError(
             "Vocab 元数据校验失败——生成逻辑或输入数据把不该出现的符号带进了 vocab。\n"
             "请修数据清洗（prepare 的 char_policy）/ 音素闸门 / 或在 lang_config.json 补声明，"
-            "而不是接受脏 vocab：\n- " + "\n- ".join(problems)
+            "而不是接受脏 vocab（注：'?' 已放开，不在此列）：\n- " + "\n- ".join(problems)
         )
 
 
@@ -199,6 +198,10 @@ def assert_vocab_within_inventory(
 # SPACE_TOKEN in nemo/collections/common/tokenizers/ipa_symbol_tokenizer.py, whose
 # longest-match text_to_tokens() re-derives the atomic tokens from this string at train time.
 SPACE_TOKEN = " "
+
+# piper_phonemize 对个别音素（如德语元音化 r ɐ）无法映射时输出的占位符。按用户要求单独放开：
+# 当作合法原子保留进 vocab（不丢行、不越界报错），不学外语的其它杂音素仍照常丢弃/报错。
+UNMAPPED_MARK = "?"
 
 
 def is_attaching(ch: str) -> bool:
@@ -474,46 +477,36 @@ def normalize_voice(voice: str) -> str:
     return voice.strip().lower().replace("_", "-")
 
 
-# espeak-ng 直连（取代 piper_phonemize）。piper_phonemize 只是 espeak-ng 的 Python 封装，但它
-# 内置的 IPA 映射表缺德语 ɐ（元音化 r），会替换成 '?' 污染数据；直连 espeak-ng --ipa 则原样输出
-# ɐ，并把自动语言切换标成 '(en)...(de)'，让我们能精确识别并丢弃混入外语发音的行。
-# 训练/推理一致性：训练用什么后端，前端推理就必须用同一 espeak-ng 直连，切勿再回退 piper。
+# piper_phonemize 实现（espeak-ng 的 Python 封装）。phonemize_espeak(text, voice) 返回
+# 句 → 词 → 音素符号的嵌套列表，扁平拼接即得词内相连、词间空格的 IPA（模型目标形态）。
+# 注：piper 内置 IPA 映射表对个别音素（如德语元音化 r ɐ）会输出 '?'，属预期，交下游按需处理。
 @functools.lru_cache(maxsize=1)
-def _espeak_bin() -> str:
-    exe = os.environ.get("ESPEAK_NG_BIN") or shutil.which("espeak-ng") or shutil.which("espeak")
-    if not exe:
+def _phonemize_espeak():
+    try:
+        from piper_phonemize import phonemize_espeak
+    except ImportError as e:
         raise RuntimeError(
-            "espeak-ng not found. Install it (apt-get install espeak-ng / brew install espeak-ng) "
-            "or set $ESPEAK_NG_BIN. This preprocessor calls espeak-ng --ipa directly (no piper_phonemize)."
-        )
-    return exe
+            "piper_phonemize not installed. Install it (pip install piper-phonemize) — "
+            "this preprocessor phonemizes via piper_phonemize.phonemize_espeak."
+        ) from e
+    return phonemize_espeak
 
 
 def run_phonemize_batch(texts: Sequence[str], voice: str) -> List[str]:
-    """一次 espeak-ng 进程批量音素化整批文本。espeak-ng --ipa 对 stdin **逐行 1:1** 输出 IPA
-    （词内音素相连、词间单空格，即模型的目标形态）。空行会被 espeak 跳过导致错位，故先滤空、
-    音素化后按原索引对齐回填。返回的行可能含 '(en)' 语言切换标记或 '?'，交由调用方判定丢弃。"""
+    """用 piper_phonemize 逐条音素化整批文本，返回与输入 **1:1 对齐** 的 IPA 串（词内音素相连、
+    词间单空格，即模型目标形态）。空文本回填空串。返回行可能含 '(en)' 语言切换标记或 '?'，交由
+    调用方判定丢弃。"""
     if not texts:
         return []
+    phonemize_espeak = _phonemize_espeak()
     out: List[str] = [""] * len(texts)
-    idx_nonempty = [i for i, t in enumerate(texts) if t and t.strip()]
-    if not idx_nonempty:
-        return out
-    payload = "\n".join(texts[i].replace("\n", " ").replace("\r", " ") for i in idx_nonempty)
-    proc = subprocess.run(
-        [_espeak_bin(), "-v", voice, "-q", "--ipa"],
-        input=payload,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"espeak-ng failed (voice={voice!r}, rc={proc.returncode}): {proc.stderr[:500]}")
-    lines = proc.stdout.split("\n")
-    if len(lines) < len(idx_nonempty):  # 对齐兜底：行数不足则补空，绝不错位
-        lines += [""] * (len(idx_nonempty) - len(lines))
-    for pos, src_idx in enumerate(idx_nonempty):
-        out[src_idx] = lines[pos].strip().replace("\n", " ")
+    for i, t in enumerate(texts):
+        if not (t and t.strip()):
+            continue
+        clean = t.replace("\n", " ").replace("\r", " ")
+        sentences = phonemize_espeak(clean, voice)  # List[sentence[List[phoneme symbol]]]
+        flat = "".join("".join(part) for part in sentences)
+        out[i] = flat.strip().replace("\n", " ")
     return out
 
 
@@ -663,9 +656,9 @@ def process_batch(
     and atom_tokens is the flat list of atomic phoneme units for building the phoneme vocab.
 
     音素级净化闸门（保证 text 侧只含目标语言音素）：整行丢弃（回填空三元组，main 会跳过）当
-      * espeak-ng 输出含 '(' 语言切换标记（如 (en)…(de)）→ 该行含外语发音；
-      * 含 '?' → espeak 无法映射的符号；
+      * 输出含 '(' 语言切换标记（如 (en)…(de)）→ 该行含外语发音；
       * 任一原子基底不在该语言 phoneme_inventory 白名单内 → 混入的外语/杂音素。
+    注：'?'（piper 无法映射的符号，如德语元音化 r ɐ）已按需放开，视为合法原子保留，不丢行。
     """
     inventories = inventories or {}
     phone_sets = phone_sets or {}
@@ -684,23 +677,27 @@ def process_batch(
         # rule alone (is_attaching()), just without any language-specific atom merging.
         multi_char_phonemes = get_multi_char_phonemes_for_voice(voice, inventories)
         allowed_phones = phone_sets.get(voice) or phone_sets.get(voice.split("-", 1)[0]) or set()
+        # '?' 单独放开：piper 无法映射的符号（如德语元音化 r ɐ）当作允许原子，不因它丢行/越界。
+        # 其余闸门保留：语言切换 (en) 行仍丢，真正的外语/杂音素仍按 inventory 丢。
+        allowed_phones = (allowed_phones | {UNMAPPED_MARK}) if allowed_phones else allowed_phones
         phon_texts = [pt for _, _, pt in indexed_items]
         ipa_lines = run_phonemize_batch(phon_texts, voice=voice)
         for (src_idx, src_grapheme, _), ipa_line in zip(indexed_items, ipa_lines):
             phoneme_str = ipa_line.strip()
-            # 语言切换 / 不可映射符号 → 丢弃（不学外语发音）。
-            if "(" in phoneme_str or "?" in phoneme_str:
+            if not phoneme_str:  # piper 无输出 → 回填空三元组（main 跳过）
+                continue
+            # 语言切换标记 (en)/(de) → 丢弃（不学外语发音）；'?' 放开保留。
+            if "(" in phoneme_str:
                 continue
             if stress_mode == "drop":
                 phoneme_str = phoneme_str.replace(PRIMARY_STRESS, "").replace(SECONDARY_STRESS, "")
 
-            # text = 词内音素拼接、词间单空格（espeak 原生形态，也是模型输出形态）；
-            # atoms = 用完整 IPA 音素表最长匹配切出的原子单元（双元音/塞擦音/长音符等保持
-            # 不可再分），仅用于统计音素词表，保证 tokenizer 最长匹配产出的 token 都在表内。
+            # text = 词内音素拼接、词间单空格（piper/espeak 原生形态，也是模型输出形态）；
+            # atoms = 用完整 IPA 音素表最长匹配切出的原子单元（双元音/塞擦音/长音符等保持不可再分）。
             phoneme_text, atoms = phonemes_to_text_and_atoms(
                 phoneme_str, stress_mode=stress_mode, multi_char_phonemes=multi_char_phonemes
             )
-            # 音素白名单校验：任一原子越界（外语/杂音素）→ 丢弃整行。
+            # 音素白名单校验：任一原子越界（外语/杂音素）→ 丢弃整行；'?' 已并入白名单，放行。
             if not atoms_are_in_language(atoms, allowed_phones):
                 continue
             results[src_idx] = (src_grapheme, phoneme_text, atoms)
@@ -884,7 +881,7 @@ def main() -> None:
     print(f"Processed rows: {processed_rows}")
     print(
         f"Phoneme-gate dropped rows: {dropped_rows} / {seen_rows} ({drop_pct:.2f}%) "
-        f"[espeak (en) language-switch / '?' / out-of-inventory phones]"
+        f"[(en) 语言切换 / 越界外语音素；'?' 已放开保留]"
     )
     print(
         f"CPU: {cpu_count}, workers: {workers}, executor: {args.executor}, "
