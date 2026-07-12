@@ -137,7 +137,14 @@ def build_voice_phone_sets(profiles: Dict[str, LanguageProfile]) -> Dict[str, Se
 
 
 def _atom_base(atom: str) -> str:
-    """去掉重音符 ˈˌ、长音符 ː 与组合符，得到音素基底，用于对照 phoneme_inventory。"""
+    """Return the inventory-check base of a phoneme atom.
+
+    Piper/espeak may emit either precomposed phones (``ç``) or decomposed forms
+    (``c`` + combining cedilla).  Normalize to NFC before stripping stress,
+    length, and true combining marks so canonical equivalents hit the same
+    inventory entry instead of turning ``ç`` into plain ``c``.
+    """
+    atom = unicodedata.normalize("NFC", atom)
     return "".join(ch for ch in atom if ch not in STRESS and ch != LENGTH and unicodedata.combining(ch) == 0)
 
 
@@ -221,6 +228,7 @@ def tokenize_phoneme_word(
     combining-mark attachment (is_attaching(), language-agnostic). Returns one atomic
     phoneme unit per token, with stress marks folded into the unit they belong to
     (mode-dependent)."""
+    ipa_word = unicodedata.normalize("NFC", ipa_word)
     units: List[str] = []
     pending_stress = ""
     join_next = False
@@ -276,6 +284,7 @@ def phonemes_to_text_and_atoms(
          so vocab.txt covers exactly the tokens the tokenizer's longest-match will produce.
     Word-internal concatenation is loss-free: "".join(units) reproduces the original word,
     so tokenize + concat round-trips (verified in run_self_check())."""
+    phoneme_str = unicodedata.normalize("NFC", phoneme_str)
     word_strs: List[str] = []
     atoms: List[str] = []
     for word in phoneme_str.split():
@@ -506,7 +515,7 @@ def run_phonemize_batch(texts: Sequence[str], voice: str) -> List[str]:
         clean = t.replace("\n", " ").replace("\r", " ")
         sentences = phonemize_espeak(clean, voice)  # List[sentence[List[phoneme symbol]]]
         flat = "".join("".join(part) for part in sentences)
-        out[i] = flat.strip().replace("\n", " ")
+        out[i] = unicodedata.normalize("NFC", flat.strip().replace("\n", " "))
     return out
 
 
