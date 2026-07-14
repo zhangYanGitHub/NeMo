@@ -128,7 +128,7 @@ def get_multi_char_phonemes_for_voice(voice: str, inventories: Dict[str, Tuple[s
 
 def build_voice_phone_sets(profiles: Dict[str, LanguageProfile]) -> Dict[str, Set[str]]:
     """{voice_code: set(allowed base phones)} —— 每语言的音素白名单（单音素基字符 ∪ 多字符原子）。
-    用于剔除混入的外语音素（如 espeak-ng 自动语言切换产出的英语 ɹ/w/θ 等）。空集合 = 不校验。"""
+    用于剔除混入的外语/未声明音素。空集合 = 不校验。"""
     out: Dict[str, Set[str]] = {}
     for prof in profiles.values():
         if prof.phoneme_inventory:
@@ -139,10 +139,9 @@ def build_voice_phone_sets(profiles: Dict[str, LanguageProfile]) -> Dict[str, Se
 def _atom_base(atom: str) -> str:
     """Return the inventory-check base of a phoneme atom.
 
-    Piper/espeak may emit either precomposed phones (``ç``) or decomposed forms
-    (``c`` + combining cedilla).  Normalize to NFC before stripping stress,
-    length, and true combining marks so canonical equivalents hit the same
-    inventory entry instead of turning ``ç`` into plain ``c``.
+    Piper/espeak may emit canonically equivalent IPA in either precomposed or
+    decomposed Unicode forms. Normalize to NFC before stripping stress, length,
+    and true combining marks so equivalent phones hit the same inventory entry.
     """
     atom = unicodedata.normalize("NFC", atom)
     return "".join(ch for ch in atom if ch not in STRESS and ch != LENGTH and unicodedata.combining(ch) == 0)
@@ -206,7 +205,7 @@ def assert_vocab_within_inventory(
 # longest-match text_to_tokens() re-derives the atomic tokens from this string at train time.
 SPACE_TOKEN = " "
 
-# piper_phonemize 对个别音素（如德语元音化 r ɐ）无法映射时输出的占位符。按用户要求单独放开：
+# piper_phonemize 对个别音素无法映射时输出的占位符。按用户要求单独放开：
 # 当作合法原子保留进 vocab（不丢行、不越界报错），不学外语的其它杂音素仍照常丢弃/报错。
 UNMAPPED_MARK = "?"
 
@@ -488,7 +487,7 @@ def normalize_voice(voice: str) -> str:
 
 # piper_phonemize 实现（espeak-ng 的 Python 封装）。phonemize_espeak(text, voice) 返回
 # 句 → 词 → 音素符号的嵌套列表，扁平拼接即得词内相连、词间空格的 IPA（模型目标形态）。
-# 注：piper 内置 IPA 映射表对个别音素（如德语元音化 r ɐ）会输出 '?'，属预期，交下游按需处理。
+# 注：piper 内置 IPA 映射表对个别未映射音素会输出 '?'，属预期，交下游按需处理。
 @functools.lru_cache(maxsize=1)
 def _phonemize_espeak():
     try:
@@ -667,7 +666,7 @@ def process_batch(
     音素级净化闸门（保证 text 侧只含目标语言音素）：整行丢弃（回填空三元组，main 会跳过）当
       * 输出含 '(' 语言切换标记（如 (en)…(de)）→ 该行含外语发音；
       * 任一原子基底不在该语言 phoneme_inventory 白名单内 → 混入的外语/杂音素。
-    注：'?'（piper 无法映射的符号，如德语元音化 r ɐ）已按需放开，视为合法原子保留，不丢行。
+    注：'?'（piper 无法映射的符号）已按需放开，视为合法原子保留，不丢行。
     """
     inventories = inventories or {}
     phone_sets = phone_sets or {}
@@ -686,7 +685,7 @@ def process_batch(
         # rule alone (is_attaching()), just without any language-specific atom merging.
         multi_char_phonemes = get_multi_char_phonemes_for_voice(voice, inventories)
         allowed_phones = phone_sets.get(voice) or phone_sets.get(voice.split("-", 1)[0]) or set()
-        # '?' 单独放开：piper 无法映射的符号（如德语元音化 r ɐ）当作允许原子，不因它丢行/越界。
+        # '?' 单独放开：piper 无法映射的符号当作允许原子，不因它丢行/越界。
         # 其余闸门保留：语言切换 (en) 行仍丢，真正的外语/杂音素仍按 inventory 丢。
         allowed_phones = (allowed_phones | {UNMAPPED_MARK}) if allowed_phones else allowed_phones
         phon_texts = [pt for _, _, pt in indexed_items]

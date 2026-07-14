@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import string
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -125,22 +127,41 @@ class CTCG2PModel(G2PModel, ASRBPEMixin, Exportable):
 
             # TODO store byt5 vocab file
         elif self.mode == "conformer_bpe":
-            grapheme_unk_token = (
-                cfg.tokenizer_grapheme.unk_token if cfg.tokenizer_grapheme.unk_token is not None else ""
-            )
-            chars = string.ascii_lowercase + grapheme_unk_token + " " + "'"
+            # 输入（grapheme）词表的单一真源 = 预处理产出的 grapheme_vocab.txt（含该语言全部字符，
+            # 例如德语 ä ö ü ß、法语重音字母、连字符 - 等）。优先使用它，让"加一种语言"变成纯数据改动、
+            # 不再改代码。仅当既没显式 tokenizer_grapheme.vocab_file、也无法从 tokenizer.dir 推导出
+            # grapheme_vocab.txt 时，才回退到旧的写死 ASCII（仅够英文）逻辑。
+            src_grapheme_vocab = self._resolve_grapheme_vocab_source(cfg)
+            if src_grapheme_vocab is not None:
+                vocab_file = self._build_char_vocab_file_from_grapheme_vocab(src_grapheme_vocab)
+                logging.info(
+                    f"conformer_bpe grapheme tokenizer built from data-driven grapheme vocab "
+                    f"{src_grapheme_vocab} (covers all language-specific characters)."
+                )
+            else:
+                grapheme_unk_token = (
+                    cfg.tokenizer_grapheme.unk_token if cfg.tokenizer_grapheme.unk_token is not None else ""
+                )
+                chars = string.ascii_lowercase + grapheme_unk_token + " " + "'"
 
-            if not cfg.tokenizer_grapheme.do_lower:
-                chars += string.ascii_uppercase
+                if not cfg.tokenizer_grapheme.do_lower:
+                    chars += string.ascii_uppercase
 
-            if cfg.tokenizer_grapheme.add_punctuation:
-                punctuation_marks = string.punctuation.replace('"', "").replace("\\", "").replace("'", "")
-                chars += punctuation_marks
+                if cfg.tokenizer_grapheme.add_punctuation:
+                    punctuation_marks = string.punctuation.replace('"', "").replace("\\", "").replace("'", "")
+                    chars += punctuation_marks
 
-            vocab_file = "/tmp/char_vocab.txt"
-            with open(vocab_file, "w") as f:
-                [f.write(f'"{ch}"\n') for ch in chars]
-                f.write('"\\""\n')  # add " to the vocab
+                vocab_file = os.path.join(tempfile.mkdtemp(prefix="g2p_char_vocab_"), "char_vocab.txt")
+                with open(vocab_file, "w", encoding="utf-8") as f:
+                    [f.write(f'"{ch}"\n') for ch in chars]
+                    f.write('"\\""\n')  # add " to the vocab
+                logging.warning(
+                    "conformer_bpe grapheme tokenizer fell back to the hardcoded ASCII inventory "
+                    "(ascii letters + space + apostrophe). This only covers English: any non-ASCII "
+                    "letter (ä ö ü ß, accents, ...) will be dropped/unk at train AND serve time. "
+                    "Provide model.tokenizer_grapheme.vocab_file (or place grapheme_vocab.txt next to "
+                    "model.tokenizer.dir) to use the language's real grapheme inventory."
+                )
 
             self.register_artifact("tokenizer_grapheme.vocab_file", vocab_file)
             grapheme_tokenizer = instantiate(cfg.tokenizer_grapheme.dataset, vocab_file=vocab_file)
@@ -149,6 +170,87 @@ class CTCG2PModel(G2PModel, ASRBPEMixin, Exportable):
         else:
             raise ValueError(f"{self.mode} is not supported. Choose from {self.supported_modes}")
         return grapheme_tokenizer
+
+    # Grapheme (input) special tokens mirrored from the preprocessing script's SPECIAL_TOKENS
+    # (examples/dataset/preprocess_ipa_childes_split.py). They occupy the first ids so that
+    # <pad> == 0 lines up with the input embedding's padding_idx=0.
+    _GRAPHEME_SPECIAL_TOKENS = {"<pad>": "pad_token", "<unk>": "unk_token"}
+
+    def _resolve_grapheme_vocab_source(self, cfg) -> Optional[str]:
+        """Return the path to a data-driven grapheme vocab (one token per line: <pad>, <unk>,
+        then one character per line), or ``None`` to fall back to the hardcoded ASCII inventory.
+
+        Priority:
+          1. ``cfg.tokenizer_grapheme.vocab_file`` if set (explicit override);
+          2. ``<cfg.tokenizer.dir>/grapheme_vocab.txt`` if it exists (co-located with the phoneme
+             ``vocab.txt`` the same preprocessing run writes) — so a single ``tokenizer.dir`` per
+             language wires both input and output vocabs.
+        """
+        explicit = cfg.tokenizer_grapheme.get("vocab_file", None)
+        if explicit:
+            p = os.path.expanduser(str(explicit))
+            if not os.path.isfile(p):
+                raise FileNotFoundError(
+                    f"model.tokenizer_grapheme.vocab_file={explicit!r} was set but does not exist. "
+                    f"Point it to the preprocessing-produced grapheme_vocab.txt, or unset it to fall "
+                    f"back to the ASCII inventory."
+                )
+            return p
+
+        tok_dir = cfg.get("tokenizer", {}).get("dir", None) if cfg.get("tokenizer", None) else None
+        if tok_dir:
+            candidate = os.path.join(os.path.expanduser(str(tok_dir)), "grapheme_vocab.txt")
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _build_char_vocab_file_from_grapheme_vocab(self, src_path: str) -> str:
+        """Convert a preprocessing ``grapheme_vocab.txt`` (plain one-token-per-line, with <pad>/<unk>
+        first and a literal space as its own line) into the on-disk format ``CharTokenizer`` expects:
+        an optional first-line JSON of special tokens, then one Python char-literal per line.
+
+        Order is preserved so token ids match ``grapheme_vocab.txt`` exactly (``<pad>``==0, ``<unk>``==1,
+        then the characters), which keeps the input embedding's ``padding_idx=0`` valid and makes the
+        exported ``grapheme_vocab`` / ``grapheme_unk_id`` line up with inference.
+        """
+        with open(src_path, "r", encoding="utf-8") as f:
+            # Keep the trailing-space line intact: only strip the newline, nothing else.
+            raw_tokens = [line.rstrip("\n") for line in f]
+        # Drop only fully empty lines (never the single-space grapheme, which is "\n" -> " ").
+        tokens = [t for t in raw_tokens if t != ""]
+
+        specials: Dict[str, str] = {}
+        chars: List[str] = []
+        for tok in tokens:
+            if tok in self._GRAPHEME_SPECIAL_TOKENS:
+                specials[self._GRAPHEME_SPECIAL_TOKENS[tok]] = tok
+                continue
+            if len(tok) != 1:
+                raise ValueError(
+                    f"grapheme vocab {src_path!r} has a multi-character entry {tok!r} that is neither "
+                    f"<pad> nor <unk>. The grapheme tokenizer is character-level; fix the preprocessing "
+                    f"output or the vocab file."
+                )
+            chars.append(tok)
+
+        out_dir = tempfile.mkdtemp(prefix="g2p_char_vocab_")
+        out_path = os.path.join(out_dir, "char_vocab.txt")
+        with open(out_path, "w", encoding="utf-8") as f:
+            if specials:
+                # CharTokenizer assigns special ids first in dict order; force pad before unk.
+                ordered = {}
+                for name in ("pad_token", "unk_token"):
+                    if name in specials:
+                        ordered[name] = specials[name]
+                f.write(json.dumps(ordered, ensure_ascii=False) + "\n")
+            for ch in chars:
+                if ch == '"':
+                    f.write('"\\""\n')  # the double-quote character
+                elif ch == "\\":
+                    f.write('"\\\\"\n')  # the backslash character
+                else:
+                    f.write(f'"{ch}"\n')
+        return out_path
 
     def _setup_encoder(self):
         if self.mode == "byt5":
@@ -161,8 +263,15 @@ class CTCG2PModel(G2PModel, ASRBPEMixin, Exportable):
             if self.cfg.decoder.feat_in is None:
                 self._cfg.decoder.feat_in = self.encoder.config.d_model
         elif self.mode == "conformer_bpe":
+            # The input embedding is indexed by GRAPHEME ids (forward() does self.embedding(input_ids)
+            # where input_ids come from tokenizer_grapheme), so it must be sized by the grapheme vocab,
+            # NOT the phoneme vocab. Sizing it by the phoneme vocab was the reason a phoneme-only
+            # vocab.txt used to crash with an index-out-of-range (and forced graphemes to be merged
+            # into vocab.txt as a workaround). Decoupling here lets the output vocab stay pure phonemes.
             self.embedding = torch.nn.Embedding(
-                embedding_dim=self._cfg.embedding.d_model, num_embeddings=self.tokenizer.vocab_size, padding_idx=0
+                embedding_dim=self._cfg.embedding.d_model,
+                num_embeddings=self.tokenizer_grapheme.vocab_size,
+                padding_idx=0,
             )
             self.encoder = EncDecCTCModel.from_config_dict(self._cfg.encoder)
             with open_dict(self._cfg):

@@ -180,9 +180,98 @@ def int_to_words_de(n: int) -> str:
     return " ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# French (fr) cardinals — standard France usage (fr-FR)
+# ---------------------------------------------------------------------------
+# Standard France (NOT Belgian/Swiss septante/nonante): 70 = soixante-dix, 80 = quatre-vingts,
+# 90 = quatre-vingt-dix. "et" links only 21/31/41/51/61/71 (vingt et un, soixante et onze);
+# 22-29, 72-79, 81-99 use hyphens without "et". "quatre-vingts" and "cents" take a plural -s
+# ONLY when word-final (nothing follows); "mille" is invariable. We spell out the standard
+# French word form; espeak-ng 'fr' then phonemizes that word normally (the SAME normalized
+# text feeds both the grapheme input and espeak, so the target stays aligned).
+_FR_ONES = [
+    "zéro", "un", "deux", "trois", "quatre", "cinq", "six", "sept", "huit", "neuf",
+    "dix", "onze", "douze", "treize", "quatorze", "quinze", "seize",
+    "dix-sept", "dix-huit", "dix-neuf",
+]
+# index 2..6 = vingt..soixante; 70/80/90 are built specially below.
+_FR_TENS = ["", "", "vingt", "trente", "quarante", "cinquante", "soixante", "", "", ""]
+
+
+def _fr_below_100(n: int) -> str:
+    if n < 20:
+        return _FR_ONES[n]
+    t, u = divmod(n, 10)
+    if t <= 6:                                       # 20..69
+        base = _FR_TENS[t]
+        if u == 0:
+            return base
+        if u == 1:                                   # vingt et un ... soixante et un
+            return f"{base} et un"
+        return f"{base}-{_FR_ONES[u]}"
+    if t == 7:                                       # 70..79 = soixante + (10..19)
+        if u == 0:
+            return "soixante-dix"
+        if u == 1:
+            return "soixante et onze"
+        return f"soixante-{_FR_ONES[10 + u]}"
+    if t == 8:                                       # 80..89
+        return "quatre-vingts" if u == 0 else f"quatre-vingt-{_FR_ONES[u]}"
+    return f"quatre-vingt-{_FR_ONES[10 + u]}"        # 90..99 = quatre-vingt + (10..19)
+
+
+def _fr_below_1000(n: int) -> str:
+    if n < 100:
+        return _fr_below_100(n)
+    h, r = divmod(n, 100)
+    head = "cent" if h == 1 else f"{_FR_ONES[h]} cent"
+    if r == 0:
+        return head if h == 1 else f"{_FR_ONES[h]} cents"   # deux cents (word-final -s)
+    return f"{head} {_fr_below_100(r)}"                       # deux cent trois (no -s)
+
+
+def _fr_strip_plural_before_scale(s: str) -> str:
+    # vingt/cent take NO plural -s when followed by another numeral (mille):
+    # quatre-vingt mille, deux cent mille (but quatre-vingts millions keeps -s: millions is a noun).
+    if s.endswith("quatre-vingts"):
+        return s[:-1]
+    if s.endswith("cents"):
+        return s[:-1]
+    return s
+
+
+def _fr_below_million(n: int) -> str:
+    if n < 1000:
+        return _fr_below_1000(n)
+    th, r = divmod(n, 1000)
+    # mille invariable; its multiplier drops the vingt/cent plural -s because "mille" follows.
+    head = "mille" if th == 1 else f"{_fr_strip_plural_before_scale(_fr_below_1000(th))} mille"
+    return head if r == 0 else f"{head} {_fr_below_1000(r)}"
+
+
+_FR_SCALES = [(10 ** 9, "milliard", "milliards"), (10 ** 6, "million", "millions")]
+
+
+def int_to_words_fr(n: int) -> str:
+    """Non-negative integer -> French cardinal words (fr-FR). 71 -> 'soixante et onze',
+    80 -> 'quatre-vingts', 345 -> 'trois cent quarante-cinq', 1000000 -> 'un million'."""
+    if n < 0:
+        return "moins " + int_to_words_fr(-n)
+    if n == 0:
+        return "zéro"
+    parts: List[str] = []
+    for value, sing, plur in _FR_SCALES:             # million/milliard are nouns (plural -s)
+        if n >= value:
+            count, n = divmod(n, value)
+            parts.append(_fr_below_million(count) + " " + (sing if count == 1 else plur))
+    if n > 0:
+        parts.append(_fr_below_million(n))
+    return " ".join(parts)
+
+
 # Cardinal spell-out dispatch by number-normalization locale (see lang_config.json's
 # 'number_locale'). Unknown locales fall back to English so nothing crashes.
-_CARDINALS = {"en": int_to_words, "de": int_to_words_de}
+_CARDINALS = {"en": int_to_words, "de": int_to_words_de, "fr": int_to_words_fr}
 
 
 def _cardinal(n: int, locale: str) -> str:
@@ -292,6 +381,12 @@ _SYMBOLS = {
         "£": " pounds ", "µ": " micro ", "×": " times ", "±": " plus minus ", "+": " plus ",
         "½": " one half ", "¼": " one quarter ", "¾": " three quarters ", "§": " section ",
     },
+    "fr": {
+        "°C": " degrés Celsius ", "°F": " degrés Fahrenheit ", "°": " degrés ",
+        "%": " pour cent ", "‰": " pour mille ", "&": " et ", "€": " euros ", "$": " dollars ",
+        "£": " livres ", "µ": " micro ", "×": " fois ", "±": " plus ou moins ", "+": " plus ",
+        "½": " un demi ", "¼": " un quart ", "¾": " trois quarts ", "§": " paragraphe ",
+    },
 }
 
 
@@ -359,6 +454,15 @@ _VERIFY_CASES = {
             # cardinals across every scale boundary (units-und-tens, hundreds, thousands, Mio.)
             "0", "1", "7", "16", "21", "45", "100", "101", "345", "500", "1024",
             "In 500 Metern rechts abbiegen", "B15", "US-101",
+        ],
+    ),
+    "fr": (
+        "fr-fr",
+        [
+            # cardinals across the French scale boundaries (et, 70/80/90 specials, cents/mille)
+            "0", "1", "16", "21", "71", "80", "81", "90", "91", "99",
+            "100", "101", "200", "345", "1000", "1984", "1000000",
+            "Dans 500 mètres tournez à droite", "A6", "N7",
         ],
     ),
 }

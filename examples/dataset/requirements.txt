@@ -1,2 +1,6 @@
+# 音素化后端：preprocess_ipa_childes_split.py 通过 piper_phonemize.phonemize_espeak 调 espeak。
 piper-phonemize>=1.1.0
 tqdm>=4.66.0
+# ftfy：修复源语料里的 mojibake（UTF-8 被当 Latin-1/CP1252 的二次编码），prepare 清洗阶段
+# 由 text_hygiene 优先调用；缺失则退回较弱的内置启发式，故强烈建议安装。
+ftfy>=6.0

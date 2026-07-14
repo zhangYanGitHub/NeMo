@@ -19,6 +19,10 @@ model:
     dataset:
       _target_: nemo.collections.common.tokenizers.char_tokenizer.CharTokenizer
     unk_token: "<unk>"
+    # 输入字符表的单一真源 = 预处理产出的 grapheme_vocab.txt（含该语言全部字符，如德语 ä ö ü ß、
+    # 法语重音、连字符 -）。留 null 时会自动从 model.tokenizer.dir 下找 grapheme_vocab.txt；找到就用它
+    # （多语言只需把 tokenizer.dir 指到对应语言目录，无需改代码）。两者都没有才回退到写死的 ASCII
+    # （仅够英文，非 ASCII 字母会在训练/推理时被丢弃）。也可在此显式给绝对路径覆盖。
     vocab_file: null
     # 保留大小写：espeak 对 B15/I-5/US-101 等按字母名发音依赖大小写；lower 会让
     # "US"(字母) 和 "us"(单词) 塌成同一输入却要对应不同音素，训练信号打架。
@@ -70,9 +74,14 @@ model:
     vocabulary: null
 
   tokenizer:
-    # ipa_symbol：目录内需有 vocab.txt（使用新预处理产物）
+    # 只需给这一个目录（该语言预处理产物目录），代码会自动定位输入/输出两张词表：
+    #   输出音素表：dir/phoneme_vocab.txt（找不到才回退 dir/vocab.txt）
+    #   输入字符表：dir/grapheme_vocab.txt（见上方 tokenizer_grapheme.vocab_file，同样自动查找）
+    # 多语言只需改这一个 dir，无需改代码或写别的路径。
     dir: dataset/normal/en-US
     type: ipa_symbol
+    # 可选：显式覆盖输出音素表路径（一般留 null，靠上面 dir 自动找 phoneme_vocab.txt）。
+    vocab_path: null
 
   train_ds:
     manifest_filepath: ${train_manifest}

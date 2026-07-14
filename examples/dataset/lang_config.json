@@ -73,6 +73,30 @@
         "schön": ["ʃˈøːn", ["ʃ", "ˈøː", "n"]]
       }
     },
+    "fr": {
+      "voice": "fr-fr",
+      "number_locale": "fr",
+      "multi_char_phonemes": ["ts", "tʃ", "dʒ"],
+      "phoneme_inventory": [
+        "a", "ɑ", "e", "ɛ", "i", "o", "ɔ", "u", "y", "ø", "œ", "ə",
+        "p", "b", "t", "d", "k", "ɡ", "f", "v", "s", "z", "ʃ", "ʒ", "m", "n", "ɲ", "l", "ʁ", "j", "w"
+      ],
+      "grapheme_inventory": " '-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZàáâãäåæçèéêëìíîïñòóôõöøùúûüýÿœÀÁÂÄÅÆÇÈÉÊËÌÍÎÏÑÒÓÔÕÖØÙÚÛÜÝŸŒ",
+      "self_check": {
+        "vin": ["vˈɛ̃", ["v", "ˈɛ̃"]],
+        "roi": ["ʁwˈa", ["ʁ", "w", "ˈa"]],
+        "montagne": ["mɔ̃tˈaɲ", ["m", "ɔ̃", "t", "ˈa", "ɲ"]],
+        "cinquante": ["sɛ̃kˈɑ̃t", ["s", "ɛ̃", "k", "ˈɑ̃", "t"]],
+        "français": ["fʁɑ̃sˈɛ", ["f", "ʁ", "ɑ̃", "s", "ˈɛ"]],
+        "chien": ["ʃjˈɛ̃", ["ʃ", "j", "ˈɛ̃"]],
+        "deux": ["dˈø", ["d", "ˈø"]],
+        "huit": ["yˈit", ["y", "ˈi", "t"]],
+        "fille": ["fˈij", ["f", "ˈi", "j"]],
+        "tsar": ["tsˈaʁ", ["ts", "ˈa", "ʁ"]],
+        "tchèque": ["tʃˈɛk", ["tʃ", "ˈɛ", "k"]],
+        "jazz": ["dʒˈaz", ["dʒ", "ˈa", "z"]]
+      }
+    },
     "en-us": {
       "voice": "en-us",
       "number_locale": "en",

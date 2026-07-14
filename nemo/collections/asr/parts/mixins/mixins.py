@@ -182,10 +182,19 @@ class ASRBPEMixin(ABC):
             )
 
         elif self.tokenizer_type == 'ipa_symbol':
-            if 'vocab_path' in self.tokenizer_cfg:
+            # 输出(音素)词表来源，只需给一个 tokenizer.dir 即可自动定位：
+            #   1) 显式 tokenizer.vocab_path（最高优先，多语言/特殊场景覆盖用）；
+            #   2) dir 下的 phoneme_vocab.txt（推荐：纯音素表，输出与 piper-phonemize 精确对齐）；
+            #   3) dir 下的 vocab.txt（历史 merged 词表，回退兜底）。
+            # 用 .get() 判真值，避免显式写 vocab_path: null 时把 None 当作路径。
+            if self.tokenizer_cfg.get('vocab_path'):
                 vocab_path = self.tokenizer_cfg.get('vocab_path')
             else:
-                vocab_path = os.path.join(self.tokenizer_dir, 'vocab.txt')
+                phoneme_vocab_path = os.path.join(self.tokenizer_dir, 'phoneme_vocab.txt')
+                if os.path.exists(phoneme_vocab_path):
+                    vocab_path = phoneme_vocab_path
+                else:
+                    vocab_path = os.path.join(self.tokenizer_dir, 'vocab.txt')
             vocab_path = self.register_artifact('tokenizer.vocab_path', vocab_path)
             self.vocab_path = vocab_path
 

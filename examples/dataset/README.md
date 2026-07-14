@@ -13,14 +13,13 @@
 新增脚本：`examples/dataset/preprocess_ipa_childes_split.py`
 
 - 只读取 CSV 两列：语言码（默认 `espeak_lang_code`）和原始文本（默认 `sentence`）
-- 不使用 CSV 里的现成 IPA 字段；`text` 通过 **`piper-phonemize` 进程内 espeak backend** 重新生成（不再频繁启动 `espeak-ng` 子进程）
-- 默认按 CPU 核数多线程并发；依赖当前 Python 环境里可导入 `piper_phonemize`。可在同一终端、同一 conda 环境里自检：
+- 不使用 CSV 里的现成 IPA 字段；`text` 通过 **直连 `espeak-ng --ipa`**（批量 stdin，逐行 1:1）重新生成。**不再用 `piper_phonemize`**：它内置的 IPA 映射表缺德语 `ɐ`（元音化 r）会替换成 `?` 污染数据，且吞掉了 espeak 的 `(en)…(de)` 语言切换标记；直连 espeak-ng 既原样输出 `ɐ`，又能精确识别语言切换行并丢弃混入外语发音的样本。**训练/推理一致性**：前端推理必须用同一 espeak-ng 直连后端，切勿回退 piper。
+- 依赖系统安装 `espeak-ng`（`apt-get install espeak-ng` / `brew install espeak-ng`；或用 `$ESPEAK_NG_BIN` 指定路径）。自检：
 
   ```bash
-  python -c "import piper_phonemize; print('ok')"
+  espeak-ng -v de -q --ipa <<< "heute ist es schön"   # 期望: hˈɔøtə ɪst ɛs ʃˈøːn
   ```
-
-  若导入失败，先安装依赖：`pip install -r examples/dataset/requirements.txt`
+- 音素/字素 vocab **由元数据锁死并在生成时校验**：`lang_config.json` 里每种语言声明 `phoneme_inventory`（该语言全部合法音素基底）与 `grapheme_inventory`（字母表）；preprocess 生成时断言观测 token ⊆ 声明集合，越界即报错并列出越界项（不产出脏 vocab）。数据侧脏字符（mojibake/CJK/符号）由 `prepare/` 阶段的 `char_policy`（`text_hygiene.py`）在写 CSV 前修复编码+白名单硬过滤。
 - 默认开启 **`tqdm` 进度条**（`--no-show-progress` 可关）；进度输出在 **stderr**，且 **`disable=False`**，即使用 `2>&1 | tee` 也会写入日志。实现上采用**有上限的并发提交 + 保序回收**，避免旧版 `executor.map` 先读完整个 CSV 再等工作、导致长时间停在 `0batch` 的问题。全表很大时开头仍会先扫一遍 CSV 统计换行（用于 `total`），终端会先出现一行 `Preprocess: counting newlines…`。
 - 输出 manifest 里 `text` 为**空格分隔的 IPA 单元**（与 `examples/tts/g2p/conf/g2p_conformer_ctc.yaml` 中的 `ipa_symbol` tokenizer 一致）
 - 输出文件（均在 `--output-dir` 下）：
