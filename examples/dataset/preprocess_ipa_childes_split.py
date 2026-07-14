@@ -484,6 +484,39 @@ def normalize_voice(voice: str) -> str:
     return voice.strip().lower().replace("_", "-")
 
 
+# 已探明可用的 espeak 语音缓存（每进程一份）。不同 espeak-ng 打包对语音代码支持不一：
+# 有的接受 'fr' 却拒绝 'fr-fr'（同时又接受 'en-us'）。CSV lang 列或 lang_config 里两种
+# 写法都可能出现，故解析时先按原样试、失败再退回主语言子标签（'fr-fr' → 'fr'）。
+_VOICE_RESOLVE_CACHE: Dict[str, str] = {}
+
+
+def resolve_espeak_voice(voice: str) -> str:
+    """把请求的 espeak-ng 语音代码解析为 *当前这套 espeak-ng 真正接受* 的代码。
+
+    先按原样尝试；失败则退回主语言子标签（如 'fr-fr' → 'fr'）。按进程缓存结果。
+    整条链路都拿不到可用语音时报错（而不是让每一行 phonemize 崩掉）。"""
+    v = normalize_voice(voice)
+    cached = _VOICE_RESOLVE_CACHE.get(v)
+    if cached is not None:
+        return cached
+    phonemize_espeak = _phonemize_espeak()
+    candidates = [v]
+    base = v.split("-", 1)[0]
+    if base and base != v:
+        candidates.append(base)
+    for cand in candidates:
+        try:
+            phonemize_espeak("a", cand)
+        except Exception:
+            continue
+        _VOICE_RESOLVE_CACHE[v] = cand
+        return cand
+    raise RuntimeError(
+        f"espeak-ng rejected voice {voice!r} (tried {candidates!r}). Set a valid 'voice' in "
+        f"lang_config.json or fix the CSV lang column; run `espeak-ng --voices` to list installed voices."
+    )
+
+
 # piper_phonemize 实现（espeak-ng 的 Python 封装）。phonemize_espeak(text, voice) 返回
 # 句 → 词 → 音素符号的嵌套列表，扁平拼接即得词内相连、词间空格的 IPA（模型目标形态）。
 # 注：piper 内置 IPA 映射表对个别未映射音素会输出 '?'，属预期，交下游按需处理。
@@ -506,6 +539,8 @@ def run_phonemize_batch(texts: Sequence[str], voice: str) -> List[str]:
     if not texts:
         return []
     phonemize_espeak = _phonemize_espeak()
+    # 解析出当前 espeak-ng 真正接受的语音代码（如 'fr-fr' → 'fr'），避免逐行崩溃。
+    voice = resolve_espeak_voice(voice)
     out: List[str] = [""] * len(texts)
     for i, t in enumerate(texts):
         if not (t and t.strip()):

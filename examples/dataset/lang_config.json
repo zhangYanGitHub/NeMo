@@ -46,7 +46,29 @@
     "German words: aɪ (mein), aʊ (Haus), ɔø (heute) diphthongs; pf/ts/tʃ/dʒ affricates (ɔø not",
     "ɔʏ is what espeak-ng 'de' emits). phoneme_inventory is the 41 base phones espeak-ng 'de'",
     "actually produces; w/θ/ð/ɹ/ɒ/ʌ/nasal ɑ̃… are ENGLISH/FRENCH and intentionally absent so",
-    "language-switch contamination fails the check instead of leaking into the vocab."
+    "language-switch contamination fails the check instead of leaking into the vocab.",
+    "",
+    "French ('fr'): voice is 'fr' (NOT 'fr-fr' — some espeak-ng builds reject the region form;",
+    "resolve_espeak_voice() still falls back 'fr-fr' -> 'fr' for rows whose CSV lang says fr-fr).",
+    "French has no native diphthongs (vowels are monophthongs), so multi_char_phonemes is only the",
+    "loanword affricates ts/tʃ/dʒ (tsar, tchèque, jazz). The four nasal VOWELS ɛ̃/ɑ̃/ɔ̃/œ̃ are 'base",
+    "vowel + combining tilde U+0303' and merge into one atomic token generically via is_attaching()",
+    "— NOT listed here. phoneme_inventory is the authentic French phone set espeak-ng 'fr' emits,",
+    "verified over 20k clean rows of the real train.csv, incl. ŋ (the borrowed nasal of parking/",
+    "camping) and the semivowels j/w (ɥ is realized as full vowel y by espeak-ng 'fr', e.g. huit ->",
+    "yˈit, so it never appears and is intentionally not listed). English phones ɪ/ʊ/ɒ/ʌ/ɜ/ɐ/θ/ð/ɹ/h",
+    "are DELIBERATELY absent: espeak anglicizes un-nativized English words/names in the data",
+    "(Street, von Braun -> wˈɜːnhə…) and those rows should be dropped by the inventory gate, not",
+    "have English pronunciations leak into the French G2P target (~4% of segments, by design).",
+    "CRITICAL — drop-in piper-phonemize fidelity: this G2P model REPLACES piper-phonemize, so the",
+    "manifest 'text' must be byte/codepoint-identical to piper's native output (read codepoint by",
+    "codepoint through piper's phoneme_id map it must yield piper's exact id sequence). Merging",
+    "codepoints into atomic vocab tokens is fine (it round-trips via ''.join and only defines the",
+    "CTC output units), but we must NOT add/remove/reorder any codepoint piper emits. Hence '-'",
+    "(U+002D, piper map id 9) is listed here as a real phone: piper emits it as a proclitic/liaison",
+    "marker on French function words (lə-/la-/də-…) and it flows into phoneme_ids, so the model must",
+    "reproduce it. It is NOT stripped. Listing it lets those ~45% of French rows pass the inventory",
+    "gate instead of being dropped, while keeping the target identical to piper."
   ],
   "default_language": "de",
   "languages": {
@@ -74,12 +96,13 @@
       }
     },
     "fr": {
-      "voice": "fr-fr",
+      "voice": "fr",
       "number_locale": "fr",
       "multi_char_phonemes": ["ts", "tʃ", "dʒ"],
       "phoneme_inventory": [
         "a", "ɑ", "e", "ɛ", "i", "o", "ɔ", "u", "y", "ø", "œ", "ə",
-        "p", "b", "t", "d", "k", "ɡ", "f", "v", "s", "z", "ʃ", "ʒ", "m", "n", "ɲ", "l", "ʁ", "j", "w"
+        "p", "b", "t", "d", "k", "ɡ", "f", "v", "s", "z", "ʃ", "ʒ", "m", "n", "ɲ", "ŋ", "l", "ʁ", "j", "w",
+        "-"
       ],
       "grapheme_inventory": " '-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZàáâãäåæçèéêëìíîïñòóôõöøùúûüýÿœÀÁÂÄÅÆÇÈÉÊËÌÍÎÏÑÒÓÔÕÖØÙÚÛÜÝŸŒ",
       "self_check": {
