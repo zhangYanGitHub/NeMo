@@ -29,7 +29,7 @@ class IPASymbolTokenizer:
         unk_token: str = "<unk>",
         pad_token: str = "<pad>",
         blank_token: Optional[str] = None,
-        normalization: str = "NFC",
+        normalization: Optional[str] = None,
         collapse_whitespace: bool = True,
         strip_text: bool = True,
         strict_inventory_check: bool = False,
@@ -56,7 +56,7 @@ class IPASymbolTokenizer:
         unk_token: str = "<unk>",
         pad_token: str = "<pad>",
         blank_token: Optional[str] = None,
-        normalization: str = "NFC",
+        normalization: Optional[str] = None,
         collapse_whitespace: bool = True,
         strip_text: bool = True,
         strict_inventory_check: bool = False,
@@ -81,7 +81,7 @@ class IPASymbolTokenizer:
         meta: Dict[str, object],
         *,
         vocab_key: str = "phoneme_labels",
-        normalization: str = "NFC",
+        normalization: Optional[str] = None,
         collapse_whitespace: bool = True,
         strip_text: bool = True,
         strict_inventory_check: bool = False,
@@ -113,7 +113,7 @@ class IPASymbolTokenizer:
         unk_token: str,
         pad_token: str,
         blank_token: Optional[str],
-        normalization: str,
+        normalization: Optional[str],
         collapse_whitespace: bool,
         strip_text: bool,
         strict_inventory_check: bool,
@@ -174,6 +174,10 @@ class IPASymbolTokenizer:
         return self.vocab[idx]
 
     def normalize(self, text: Optional[str]) -> str:
+        # Default normalization=None: the vocab and manifest keep espeak/piper's NATIVE Unicode
+        # form (e.g. ç = c + combining cedilla), so any Unicode normalization here would DIVERGE
+        # from the vocab (NFC would compose ç -> U+00E7, which is absent from the decomposed vocab
+        # and would fall to <unk>). Leave codepoints untouched unless a caller explicitly opts in.
         if text is None:
             return ""
         if self.normalization:

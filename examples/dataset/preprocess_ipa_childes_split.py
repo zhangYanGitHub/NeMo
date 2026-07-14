@@ -226,8 +226,8 @@ def tokenize_phoneme_word(
     get_multi_char_phonemes_for_voice()/lang_config.json) plus generic
     combining-mark attachment (is_attaching(), language-agnostic). Returns one atomic
     phoneme unit per token, with stress marks folded into the unit they belong to
-    (mode-dependent)."""
-    ipa_word = unicodedata.normalize("NFC", ipa_word)
+    (mode-dependent). No NFC here: the espeak/piper native Unicode form is preserved so
+    tokens stay drop-in compatible with the original piper TTS phoneme_id_map."""
     units: List[str] = []
     pending_stress = ""
     join_next = False
@@ -283,7 +283,6 @@ def phonemes_to_text_and_atoms(
          so vocab.txt covers exactly the tokens the tokenizer's longest-match will produce.
     Word-internal concatenation is loss-free: "".join(units) reproduces the original word,
     so tokenize + concat round-trips (verified in run_self_check())."""
-    phoneme_str = unicodedata.normalize("NFC", phoneme_str)
     word_strs: List[str] = []
     atoms: List[str] = []
     for word in phoneme_str.split():
@@ -514,7 +513,10 @@ def run_phonemize_batch(texts: Sequence[str], voice: str) -> List[str]:
         clean = t.replace("\n", " ").replace("\r", " ")
         sentences = phonemize_espeak(clean, voice)  # List[sentence[List[phoneme symbol]]]
         flat = "".join("".join(part) for part in sentences)
-        out[i] = unicodedata.normalize("NFC", flat.strip().replace("\n", " "))
+        # 不做 NFC：保留 piper/espeak 原生 Unicode 形式（如 ç = c+组合 cedilla），
+        # 使训练目标与原生 piper TTS 逐码点 drop-in 一致；piper 输出对同一音素是确定且
+        # 自洽的（不会混用预组合/分解），故无需归一。
+        out[i] = flat.strip().replace("\n", " ")
     return out
 
 
