@@ -1,0 +1,22 @@
+# G2P Conformer-CTC ONNX 工具链依赖（版本固定自 conda 环境 `tntts`）
+# 仅包含本目录 6 个脚本实际 import 的第三方库；g2p_text_frontend.py 只用标准库。
+#
+# 按需安装：纯 ONNX 推理 / 量化 / 报告不需要 torch 与 nemo_toolkit，
+# 只有导出脚本（export_nemo_g2p_ctc_onnx.py）需要它们。
+
+# --- 纯 ONNX 推理 + 量化（g2p_nemo_client.py / quantize_g2p_onnx.py） ---
+numpy==2.2.6
+onnx==1.21.0
+onnxruntime==1.23.2
+tqdm==4.67.3          # g2p_nemo_client 进度条（缺失时自动降级，非硬依赖）
+
+# --- 报告生成（g2p_evaluate.py / generate_comparison_summary.py） ---
+jinja2==3.1.6
+
+# --- 一键报告流水线的 espeak-ng 参考（run_report_pipeline.py / espeak_ng_client.py） ---
+# 另需系统安装 espeak-ng（macOS: brew install espeak-ng）。GPL 组件，按需使用。
+piper-phonemize
+
+# --- 导出 ONNX（export_nemo_g2p_ctc_onnx.py，需完整 NeMo + torch 环境） ---
+torch==2.2.2
+nemo_toolkit==2.6.1
