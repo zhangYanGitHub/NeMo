@@ -269,9 +269,80 @@ def int_to_words_fr(n: int) -> str:
     return " ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Arabic (ar) cardinals — MSA, same rules as prepare/config/ar_XA/hardcase_number_style.py
+# ---------------------------------------------------------------------------
+_AR_ONES = [
+    "صفر", "واحد", "اثنان", "ثلاثة", "أربعة", "خمسة", "ستة", "سبعة", "ثمانية", "تسعة",
+    "عشرة", "أحد عشر", "اثنا عشر", "ثلاثة عشر", "أربعة عشر", "خمسة عشر", "ستة عشر",
+    "سبعة عشر", "ثمانية عشر", "تسعة عشر",
+]
+_AR_TENS = ["", "", "عشرون", "ثلاثون", "أربعون", "خمسون", "ستون", "سبعون", "ثمانون", "تسعون"]
+_AR_HUNDRED_STEMS = {
+    "3": "ثلاث", "4": "أربع", "5": "خمس", "6": "ست", "7": "سبع", "8": "ثمان", "9": "تسع",
+}
+_AR_BIG_SCALES = [(10 ** 9, "مليار", "مليارات"), (10 ** 6, "مليون", "مليون")]
+
+
+def _ar_two_digit(n: int) -> str:
+    if n < 20:
+        return _AR_ONES[n]
+    t, u = divmod(n, 10)
+    if u == 0:
+        return _AR_TENS[t]
+    return _AR_ONES[u] + " و" + _AR_TENS[t]
+
+
+def _ar_hundred_head(h: int) -> str:
+    if h == 1:
+        return "مائة"
+    if h == 2:
+        return "مائتان"
+    stem = _AR_HUNDRED_STEMS.get(str(h))
+    if not stem:
+        stem = _AR_ONES[h]
+        if stem.endswith("ة"):
+            stem = stem[:-1]
+    return stem + "مائة"
+
+
+def _ar_thousand_head(th: int) -> str:
+    if th == 1:
+        return "ألف"
+    if th == 2:
+        return "ألفان"
+    if 3 <= th <= 10:
+        return _AR_ONES[th] + " آلاف"
+    return int_to_words_ar(th) + " ألف"
+
+
+def int_to_words_ar(n: int) -> str:
+    """Non-negative integer -> MSA cardinal words. 500 -> 'خمسمائة', 21 -> 'واحد وعشرون'."""
+    if n == 0:
+        return _AR_ONES[0]
+    if n < 0:
+        return "سالب " + int_to_words_ar(-n)
+    for val, sing, plur in _AR_BIG_SCALES:
+        if n >= val:
+            q, r = divmod(n, val)
+            head = sing if q == 1 else (int_to_words_ar(q) + " " + plur)
+            return head if r == 0 else head + " و " + int_to_words_ar(r)
+    if n >= 1000:
+        th, r = divmod(n, 1000)
+        head = _ar_thousand_head(th)
+        return head if r == 0 else head + " و " + int_to_words_ar(r)
+    if n >= 100:
+        h, r = divmod(n, 100)
+        head = _ar_hundred_head(h)
+        return head if r == 0 else head + " و " + int_to_words_ar(r)
+    if n < 20:
+        return _AR_ONES[n]
+    return _ar_two_digit(n)
+
+
 # Cardinal spell-out dispatch by number-normalization locale (see lang_config.json's
 # 'number_locale'). Unknown locales fall back to English so nothing crashes.
-_CARDINALS = {"en": int_to_words, "de": int_to_words_de, "fr": int_to_words_fr}
+_CARDINALS = {"en": int_to_words, "de": int_to_words_de, "fr": int_to_words_fr, "ar": int_to_words_ar}
 
 
 def _cardinal(n: int, locale: str) -> str:
@@ -463,6 +534,13 @@ _VERIFY_CASES = {
             "0", "1", "16", "21", "71", "80", "81", "90", "91", "99",
             "100", "101", "200", "345", "1000", "1984", "1000000",
             "Dans 500 mètres tournez à droite", "A6", "N7",
+        ],
+    ),
+    "ar": (
+        "ar",
+        [
+            "0", "1", "7", "16", "21", "45", "100", "101", "345", "500", "1024",
+            "بعد 500 متر انعطف يمينا", "الحد الأقصى للسرعة 120",
         ],
     ),
 }

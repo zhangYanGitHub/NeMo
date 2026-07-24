@@ -138,7 +138,7 @@
     },
     "ar": {
       "voice": "ar",
-      "number_locale": "en",
+      "number_locale": "ar",
       "diacritizer": {
         "_note": "local_nav_diacritizer (vivid-ai-app-tntts-training run_ar_XA_diacritized.sh). Default resources under examples/dataset/ar_XA/resources/. Preprocess: --language ar (diacritize on by default). Inference: g2p_text_frontend.prepare_arabic_grapheme_text().",
         "rules": "ar_XA/resources/nav_diacritizer_rules.json",
