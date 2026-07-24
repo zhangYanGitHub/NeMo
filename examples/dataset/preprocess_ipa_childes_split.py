@@ -31,6 +31,7 @@ MANIFEST_WRITE_BUFFER_LINES = 1024
 # Arabic phase-1: small batches balance slow tashkeel rows across workers.
 AR_DIACRITIZE_BATCH_SIZE = 8
 AR_DIACRITIZED_CACHE_SUFFIX = ".diacritized.csv"
+AR_DIACRITIZED_PART_SUFFIX = ".diacritized.part.csv"
 
 # EVERYTHING language-specific (espeak voice, number-normalization locale, the multi-character
 # phoneme atom whitelist, and the self-check regression cases) lives in lang_config.json, NOT
@@ -483,8 +484,8 @@ def parse_args() -> argparse.Namespace:
         "--refresh-diacritize-cache",
         action="store_true",
         help=(
-            "Re-run Arabic phase-1 diacritization even when a cached "
-            "<input_stem>.diacritized.csv exists under --output-dir."
+            "Re-run Arabic phase-1 diacritization from scratch (deletes cached "
+            "<input_stem>.diacritized.csv and any in-progress .part file)."
         ),
     )
     parser.add_argument("--manifest-name", type=str, default="train.json")
@@ -691,14 +692,42 @@ def iter_csv_raw_rows(
         yield lang, row[text_idx]
 
 
+def diacritized_cache_paths(output_dir: Path, input_stem: str) -> Tuple[Path, Path]:
+    """Return (final_cache_csv, in_progress_part_csv) for Arabic phase-1."""
+    final_csv = output_dir / f"{input_stem}{AR_DIACRITIZED_CACHE_SUFFIX}"
+    part_csv = output_dir / f"{input_stem}{AR_DIACRITIZED_PART_SUFFIX}"
+    return final_csv, part_csv
+
+
+def expected_diacritized_row_count(input_csv: Path, limit: int) -> int:
+    if limit > 0:
+        return limit
+    return approx_csv_body_line_count(input_csv)
+
+
+def diacritized_cache_is_complete(cache_csv: Path, expected_rows: int) -> bool:
+    """True when *cache_csv* exists and has exactly *expected_rows* data lines."""
+    if expected_rows <= 0 or not cache_csv.is_file():
+        return False
+    return approx_csv_body_line_count(cache_csv) == expected_rows
+
+
+def clear_diacritized_cache_files(cache_csv: Path, part_csv: Path) -> None:
+    for path in (cache_csv, part_csv):
+        if path.is_file():
+            path.unlink()
+
+
 def iter_csv_record_rows(
     csv_path: Path,
     text_field: str,
     lang_field: str,
     limit: int,
+    skip: int = 0,
 ) -> Iterator[Tuple[List[str], int, int]]:
     """Yield ``(row, text_idx, lang_idx)`` preserving the full CSV record."""
     seen = 0
+    skipped = 0
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
         header = next(reader)
@@ -716,6 +745,9 @@ def iter_csv_record_rows(
                 continue
             raw = row[text_idx]
             if not raw or not raw.strip():
+                continue
+            if skipped < skip:
+                skipped += 1
                 continue
             yield row, text_idx, lang_idx
             seen += 1
@@ -979,6 +1011,7 @@ def diacritize_records_batch(
 def run_diacritize_phase(
     input_csv: Path,
     output_csv: Path,
+    part_csv: Path,
     text_field: str,
     lang_field: str,
     limit: int,
@@ -989,22 +1022,40 @@ def run_diacritize_phase(
     executor_name: str,
     show_progress: bool,
 ) -> None:
-    """Phase 1 (Arabic only): parallel diacritization with per-worker cache; write a reusable CSV."""
+    """Phase 1 (Arabic only): parallel diacritization; resume via *part_csv*, finalize to *output_csv*."""
     get_local_nav_diacritizer(rules_s, letter_s)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
+    expected_rows = expected_diacritized_row_count(input_csv, limit)
+
     with input_csv.open("r", encoding="utf-8", newline="") as src:
         reader = csv.reader(src)
         header = next(reader)
 
-    record_iter = iter_csv_record_rows(input_csv, text_field, lang_field, limit)
+    resume_rows = 0
+    write_mode = "w"
+    if part_csv.is_file():
+        resume_rows = approx_csv_body_line_count(part_csv)
+        if resume_rows > 0:
+            write_mode = "a"
+            print(
+                f"Resuming Arabic phase-1 from row {resume_rows + 1}/{expected_rows} "
+                f"({part_csv.name})",
+                flush=True,
+            )
+        elif part_csv.stat().st_size > 0:
+            part_csv.unlink()
+
+    if resume_rows >= expected_rows:
+        os.replace(part_csv, output_csv)
+        print(f"Diacritized cache finalized: {output_csv}", flush=True)
+        return
+
+    record_iter = iter_csv_record_rows(input_csv, text_field, lang_field, limit, skip=resume_rows)
+    remaining_rows = max(0, expected_rows - resume_rows)
     if show_progress:
-        if limit > 0:
-            est_rows = limit
-        else:
-            est_rows = approx_csv_body_line_count(input_csv)
-        est_batches = max(1, (est_rows + AR_DIACRITIZE_BATCH_SIZE - 1) // AR_DIACRITIZE_BATCH_SIZE)
+        est_batches = max(1, (remaining_rows + AR_DIACRITIZE_BATCH_SIZE - 1) // AR_DIACRITIZE_BATCH_SIZE)
         print(
-            f"Arabic phase-1 diacritization: {est_rows} rows -> {output_csv.name}",
+            f"Arabic phase-1 diacritization: {remaining_rows} rows remaining -> {output_csv.name}",
             file=sys.stderr,
             flush=True,
         )
@@ -1028,9 +1079,10 @@ def run_diacritize_phase(
     if mp_context is not None:
         executor_kwargs["mp_context"] = mp_context
 
-    with output_csv.open("w", encoding="utf-8", newline="") as out_f:
+    with part_csv.open(write_mode, encoding="utf-8", newline="") as out_f:
         writer = csv.writer(out_f)
-        writer.writerow(header)
+        if write_mode == "w":
+            writer.writerow(header)
         with executor_cls(**executor_kwargs) as executor:
             progress_bar = None
             if show_progress:
@@ -1054,6 +1106,13 @@ def run_diacritize_phase(
             if progress_bar is not None:
                 progress_bar.close()
 
+    if not diacritized_cache_is_complete(part_csv, expected_rows):
+        raise RuntimeError(
+            f"Arabic phase-1 incomplete: {part_csv} has "
+            f"{approx_csv_body_line_count(part_csv)} / {expected_rows} rows. "
+            f"Re-run the same command to resume from the .part checkpoint."
+        )
+    os.replace(part_csv, output_csv)
     print(f"Wrote diacritized cache: {output_csv}", flush=True)
 
 
@@ -1142,11 +1201,24 @@ def main() -> None:
         phonemize_csv = args.diacritized_csv.expanduser().resolve()
         print(f"Using pre-diacritized CSV for phonemize: {phonemize_csv}", flush=True)
     elif run_ar_diacritize_phase:
-        cache_csv = output_dir / f"{input_csv.stem}{AR_DIACRITIZED_CACHE_SUFFIX}"
-        if not cache_csv.exists() or args.refresh_diacritize_cache:
+        cache_csv, part_csv = diacritized_cache_paths(output_dir, input_csv.stem)
+        expected_rows = expected_diacritized_row_count(input_csv, args.limit)
+        if args.refresh_diacritize_cache:
+            clear_diacritized_cache_files(cache_csv, part_csv)
+        if diacritized_cache_is_complete(cache_csv, expected_rows):
+            print(f"Reusing diacritized cache: {cache_csv}", flush=True)
+        else:
+            if cache_csv.is_file() and not diacritized_cache_is_complete(cache_csv, expected_rows):
+                print(
+                    f"Incomplete diacritized cache ignored ({cache_csv.name}); "
+                    f"will resume from .part if present.",
+                    flush=True,
+                )
+                cache_csv.unlink()
             run_diacritize_phase(
                 input_csv=input_csv,
                 output_csv=cache_csv,
+                part_csv=part_csv,
                 text_field=args.text_field,
                 lang_field=args.lang_field,
                 limit=args.limit,
@@ -1157,8 +1229,6 @@ def main() -> None:
                 executor_name=executor_name,
                 show_progress=args.show_progress,
             )
-        else:
-            print(f"Reusing diacritized cache: {cache_csv}", flush=True)
         phonemize_csv = cache_csv
 
     # Phase 2 (all languages): TN + segment + espeak phonemize — same path for en/de/fr/ar.
