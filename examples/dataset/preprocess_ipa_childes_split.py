@@ -591,26 +591,59 @@ def run_phonemize_batch(texts: Sequence[str], voice: str) -> List[str]:
     return out
 
 
-def iter_csv_rows(
+def _pool_worker_init_diacritizer(
+    rules_path: Optional[str],
+    letter_map_path: Optional[str],
+) -> None:
+    """ProcessPool worker hook: load diacritizer rules once per worker before any batch."""
+    from ar_XA.diacritizer_frontend import get_local_nav_diacritizer
+
+    get_local_nav_diacritizer(rules_path, letter_map_path)
+
+
+def _prepare_row_segments(
+    lang: str,
+    raw: str,
+    *,
+    default_voice: str,
+    diacritize_arabic: bool,
+    diacritizer_rules: Optional[str],
+    diacritizer_letter_map: Optional[str],
+    normalize_nums: bool,
+    number_locale: str,
+    strip_punct: bool,
+    split_punct: bool,
+) -> List[Tuple[str, str, str]]:
+    """Diacritize / TN / segment one CSV row -> (lang, grapheme, phonemize) triples."""
+    raw_for_row = raw
+    if diacritize_arabic and is_arabic_voice(lang or default_voice):
+        raw_for_row = diacritize_arabic_line(
+            raw,
+            rules_path=diacritizer_rules,
+            letter_map_path=diacritizer_letter_map,
+        )
+
+    # Grapheme input and phonemize input are the same normalized text
+    # (no letter-"A" / "A-" special-casing): the model sees exactly the
+    # text espeak phonemizes into the target.
+    text = normalize_for_g2p(raw_for_row, locale=number_locale) if normalize_nums else raw_for_row
+    text = normalize_text(text)
+
+    if split_punct:
+        return [(lang, seg, seg) for seg in split_into_segments(text) if seg]
+    if strip_punct:
+        seg = strip_punctuation(text)
+        return [(lang, seg, seg)] if seg else []
+    return [(lang, text, text)] if text else []
+
+
+def iter_csv_raw_rows(
     csv_path: Path,
     text_field: str,
     lang_field: str,
     limit: int,
-    strip_punct: bool = False,
-    split_punct: bool = False,
-    normalize_nums: bool = False,
-    number_locale: str = "en",
-    diacritize_arabic: bool = False,
-    default_voice: str = "",
-    diacritizer_rules: Optional[Path] = None,
-    diacritizer_letter_map: Optional[Path] = None,
-) -> Iterator[Tuple[str, str, str]]:
-    """Yield ``(lang, grapheme_text, phonemize_text)`` triples.
-
-    *grapheme_text* is the model's input (clean TN, no digits) and
-    *phonemize_text* (fed to piper/espeak) are identical: the same normalized
-    text goes to both, so training input and phoneme target stay in lockstep.
-    """
+) -> Iterator[Tuple[str, str]]:
+    """Fast CSV reader: yield ``(lang, raw_text)`` without diacritize/TN (done in workers)."""
     seen = 0
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
@@ -631,39 +664,56 @@ def iter_csv_rows(
             if not raw or not raw.strip():
                 continue
             lang = row[lang_idx].strip() if lang_idx < len(row) else ""
-            raw_for_row = raw
-            if diacritize_arabic and is_arabic_voice(lang or default_voice):
-                raw_for_row = diacritize_arabic_line(
-                    raw,
-                    rules_path=str(diacritizer_rules) if diacritizer_rules else None,
-                    letter_map_path=str(diacritizer_letter_map) if diacritizer_letter_map else None,
-                )
-
-            # Grapheme input and phonemize input are the same normalized text
-            # (no letter-"A" / "A-" special-casing): the model sees exactly the
-            # text espeak phonemizes into the target.
-            text = normalize_for_g2p(raw_for_row, locale=number_locale) if normalize_nums else raw_for_row
-            text = normalize_text(text)
-
-            if split_punct:
-                segs = split_into_segments(text)
-                segment_pairs = [(seg, seg) for seg in segs]
-            elif strip_punct:
-                seg = strip_punctuation(text)
-                segment_pairs = [(seg, seg)] if seg else []
-            else:
-                segment_pairs = [(text, text)]
-
-            for g_seg, p_seg in segment_pairs:
-                if g_seg:
-                    yield (lang, g_seg, p_seg)
-                    seen += 1
-                    if limit > 0 and seen >= limit:
-                        return
+            yield (lang, raw)
+            seen += 1
+            if limit > 0 and seen >= limit:
+                return
 
 
-def iter_batches(rows: Iterator[Tuple[str, str, str]], batch_size: int) -> Iterator[List[Tuple[str, str, str]]]:
-    batch: List[Tuple[str, str, str]] = []
+def iter_csv_rows(
+    csv_path: Path,
+    text_field: str,
+    lang_field: str,
+    limit: int,
+    strip_punct: bool = False,
+    split_punct: bool = False,
+    normalize_nums: bool = False,
+    number_locale: str = "en",
+    diacritize_arabic: bool = False,
+    default_voice: str = "",
+    diacritizer_rules: Optional[Path] = None,
+    diacritizer_letter_map: Optional[Path] = None,
+) -> Iterator[Tuple[str, str, str]]:
+    """Yield ``(lang, grapheme_text, phonemize_text)`` triples.
+
+    *grapheme_text* is the model's input (clean TN, no digits) and
+    *phonemize_text* (fed to piper/espeak) are identical: the same normalized
+    text goes to both, so training input and phoneme target stay in lockstep.
+    """
+    rules_s = str(diacritizer_rules) if diacritizer_rules else None
+    letter_s = str(diacritizer_letter_map) if diacritizer_letter_map else None
+    seen = 0
+    for lang, raw in iter_csv_raw_rows(csv_path, text_field, lang_field, limit=0):
+        for triple in _prepare_row_segments(
+            lang,
+            raw,
+            default_voice=default_voice,
+            diacritize_arabic=diacritize_arabic,
+            diacritizer_rules=rules_s,
+            diacritizer_letter_map=letter_s,
+            normalize_nums=normalize_nums,
+            number_locale=number_locale,
+            strip_punct=strip_punct,
+            split_punct=split_punct,
+        ):
+            yield triple
+            seen += 1
+            if limit > 0 and seen >= limit:
+                return
+
+
+def iter_batches(rows: Iterator, batch_size: int) -> Iterator[List]:
+    batch: List = []
     for row in rows:
         batch.append(row)
         if len(batch) >= batch_size:
@@ -686,18 +736,10 @@ def approx_csv_body_line_count(csv_path: Path) -> int:
 def ordered_process_batches(
     executor: Executor,
     max_in_flight: int,
-    batches_iter: Iterator[List[Tuple[str, str, str]]],
-    default_voice: str,
-    stress_mode: str,
-    strip_punct: bool = False,
-    inventories: Dict[str, Tuple[str, ...]] = None,
-    phone_sets: Dict[str, Set[str]] = None,
-    grapheme_sets: Dict[str, frozenset] = None,
+    batches_iter: Iterator[List],
+    process_fn,
 ) -> Iterator[List[Tuple[str, str, List[str]]]]:
-    """Like executor.map(process_batch, ...) but submit only max_in_flight tasks ahead; preserve order."""
-    inventories = inventories or {}
-    phone_sets = phone_sets or {}
-    grapheme_sets = grapheme_sets or {}
+    """Like executor.map(process_fn, ...) but submit only max_in_flight tasks ahead; preserve order."""
     it = enumerate(batches_iter)
     pending: dict = {}
     saved: dict[int, List[Tuple[str, str, List[str]]]] = {}
@@ -712,9 +754,7 @@ def ordered_process_batches(
             except StopIteration:
                 exhausted = True
                 return
-            fut = executor.submit(
-                process_batch, batch, default_voice, stress_mode, strip_punct, inventories, phone_sets, grapheme_sets
-            )
+            fut = executor.submit(process_fn, batch)
             pending[fut] = idx
 
     def emit_ready() -> Iterator[List[Tuple[str, str, List[str]]]]:
@@ -806,6 +846,50 @@ def process_batch(
     return results
 
 
+def process_raw_batch(
+    batch_rows: Sequence[Tuple[str, str]],
+    default_voice: str,
+    stress_mode: str,
+    strip_punct: bool,
+    split_punct: bool,
+    phoneme_strip_punct: bool,
+    normalize_nums: bool,
+    number_locale: str,
+    diacritize_arabic: bool,
+    diacritizer_rules: Optional[str],
+    diacritizer_letter_map: Optional[str],
+    inventories: Dict[str, Tuple[str, ...]],
+    phone_sets: Dict[str, Set[str]],
+    grapheme_sets: Dict[str, frozenset],
+) -> List[Tuple[str, str, List[str]]]:
+    """Expand raw CSV rows in-worker (diacritize/TN/segment), then phonemize."""
+    segment_rows: List[Tuple[str, str, str]] = []
+    for lang, raw in batch_rows:
+        segment_rows.extend(
+            _prepare_row_segments(
+                lang,
+                raw,
+                default_voice=default_voice,
+                diacritize_arabic=diacritize_arabic,
+                diacritizer_rules=diacritizer_rules,
+                diacritizer_letter_map=diacritizer_letter_map,
+                normalize_nums=normalize_nums,
+                number_locale=number_locale,
+                strip_punct=strip_punct,
+                split_punct=split_punct,
+            )
+        )
+    return process_batch(
+        segment_rows,
+        default_voice,
+        stress_mode,
+        phoneme_strip_punct,
+        inventories,
+        phone_sets,
+        grapheme_sets,
+    )
+
+
 def write_vocab(path: Path, tokens: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -875,7 +959,42 @@ def main() -> None:
     auto_workers, auto_batch_size = recommend_runtime(cpu_count)
     workers = args.workers if args.workers > 0 else auto_workers
     batch_size = args.batch_size if args.batch_size > 0 else auto_batch_size
+    if diacritize_arabic and args.batch_size <= 0:
+        # Smaller raw-row batches -> more parallel diacritize jobs; phonemize still batched per worker.
+        batch_size = min(batch_size, 256)
     executor_cls = ProcessPoolExecutor if args.executor == "process" else ThreadPoolExecutor
+
+    # Splitting always yields punctuation-free segments, so the phoneme-side defensive
+    # filter must run whenever either stripping or splitting is on.
+    effective_strip = args.strip_punctuation or args.split_on_punctuation
+
+    rules_s = str(diacritizer_rules) if diacritizer_rules else None
+    letter_s = str(diacritizer_letter_map) if diacritizer_letter_map else None
+    process_fn = functools.partial(
+        process_raw_batch,
+        default_voice=default_voice,
+        stress_mode=args.stress,
+        strip_punct=args.strip_punctuation,
+        split_punct=args.split_on_punctuation,
+        phoneme_strip_punct=effective_strip,
+        normalize_nums=args.normalize_numbers,
+        number_locale=profile.number_locale,
+        diacritize_arabic=diacritize_arabic,
+        diacritizer_rules=rules_s,
+        diacritizer_letter_map=letter_s,
+        inventories=inventories,
+        phone_sets=phone_sets,
+        grapheme_sets=grapheme_sets,
+    )
+    pool_initializer = None
+    pool_initargs: Tuple = ()
+    if diacritize_arabic:
+        pool_initializer = _pool_worker_init_diacritizer
+        pool_initargs = (rules_s, letter_s)
+        print(
+            "Arabic diacritization: rules preloaded per worker; diacritize+phonemize run in parallel.",
+            flush=True,
+        )
 
     if args.show_progress:
         print("Preprocess: counting newlines in CSV for tqdm total…", file=sys.stderr, flush=True)
@@ -901,40 +1020,18 @@ def main() -> None:
         manifest_f.write("\n")
         manifest_buffer = []
 
-    # Splitting always yields punctuation-free segments, so the phoneme-side defensive
-    # filter must run whenever either stripping or splitting is on.
-    effective_strip = args.strip_punctuation or args.split_on_punctuation
-
     batch_iter = iter_batches(
-        iter_csv_rows(
-            input_csv,
-            args.text_field,
-            args.lang_field,
-            args.limit,
-            args.strip_punctuation,
-            args.split_on_punctuation,
-            args.normalize_numbers,
-            profile.number_locale,
-            diacritize_arabic,
-            default_voice,
-            diacritizer_rules,
-            diacritizer_letter_map,
-        ),
+        iter_csv_raw_rows(input_csv, args.text_field, args.lang_field, args.limit),
         batch_size,
     )
 
     with manifest_path.open("w", encoding="utf-8") as manifest_f:
-        with executor_cls(max_workers=workers) as executor:
+        with executor_cls(max_workers=workers, initializer=pool_initializer, initargs=pool_initargs) as executor:
             ordered = ordered_process_batches(
                 executor,
                 max(1, workers * 2),
                 batch_iter,
-                default_voice,
-                args.stress,
-                effective_strip,
-                inventories,
-                phone_sets,
-                grapheme_sets,
+                process_fn,
             )
             if args.show_progress:
                 ordered = tqdm(
