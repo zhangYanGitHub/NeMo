@@ -33,8 +33,8 @@ SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
 # Arabic phase-1 (local_nav_diacritizer, ref. run_ar_XA_diacritized.sh):
 #   diacritize raw CSV -> cache; phase-2 does normalize_text + normalize_for_g2p + espeak.
-AR_DIACRITIZE_CHUNK_ROWS = 64
-AR_DIACRITIZE_DEFAULT_CHUNKSIZE = 4
+AR_DIACRITIZE_CHUNK_ROWS = 16
+AR_DIACRITIZE_DEFAULT_CHUNKSIZE = 1
 AR_DIACRITIZE_LRU_SIZE = 262144
 AR_DIACRITIZED_CACHE_SUFFIX = ".diacritized.csv"
 AR_DIACRITIZED_PART_SUFFIX = ".diacritized.part.csv"
@@ -684,8 +684,6 @@ def _diacritize_with_lookup(raw: str) -> str:
     return result
 
 
-_worker_rows_processed = 0
-
 def diacritize_chunk_task(chunk: Sequence[Tuple[List[str], int, int]]) -> List[List[str]]:
     """Diacritize up to AR_DIACRITIZE_CHUNK_ROWS records; dedupe identical sentences in-chunk."""
     global _worker_rows_processed
@@ -698,15 +696,10 @@ def diacritize_chunk_task(chunk: Sequence[Tuple[List[str], int, int]]) -> List[L
             continue
         raw = row[text_idx]
         if raw not in unique_raws:
-            t0 = time.time()
             unique_raws[raw] = _diacritize_with_lookup(raw)
-            if _worker_rows_processed == 0:
-                import os
-                print(f"[Worker {os.getpid()}] First row ONNX inference took {time.time() - t0:.2f}s", file=sys.stderr, flush=True)
         new_row = list(row)
         new_row[text_idx] = unique_raws[raw]
         out_rows.append(new_row)
-        _worker_rows_processed += 1
     return out_rows
 
 
@@ -1126,10 +1119,7 @@ def recommend_diacritize_workers(cpu_count: int) -> int:
 
 def recommend_diacritize_chunksize(workers: int) -> int:
     """Pool.imap chunksize: bundle a few rows per scheduling round."""
-    if workers >= 64:
-        return 8
-    if workers >= 16:
-        return 4
+    # 强制设置为 1，防止进程间通信管道（IPC）被大块数据撑爆导致死锁
     return AR_DIACRITIZE_DEFAULT_CHUNKSIZE
 
 
@@ -1233,26 +1223,35 @@ def run_diacritize_phase(
         with mp_ctx.Pool(**pool_kwargs) as pool:
             # 立即打印一行，确认 Pool 已经创建并开始喂数据
             print("Phase-1: Pool created, feeding data to workers...", file=sys.stderr, flush=True)
-            for out_rows in pool.imap_unordered(diacritize_chunk_task, chunk_iter, chunksize=chunksize):
-                batches_done += 1
-                rows_done += len(out_rows)
-                if batches_done == 1:
-                    print(
-                        f"Phase-1: first batch ({len(out_rows)} rows) in {time.time() - t_pool:.1f}s "
-                        f"— progress bar will advance now",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                writer.writerows(out_rows)
-                if progress_bar is not None:
-                    progress_bar.update(len(out_rows))
-                pending_flush += len(out_rows)
-                if pending_flush >= 2048:
-                    out_f.flush()
-                    pending_flush = 0
-            # 显式关闭并等待进程池结束
-            pool.close()
-            pool.join()
+            
+            # 使用 imap_unordered 时，由于生成器是惰性的，我们需要确保 chunk_iter 被持续喂给 pool
+            # chunksize 控制了每个 worker 一次领取的任务数
+            try:
+                for out_rows in pool.imap_unordered(diacritize_chunk_task, chunk_iter, chunksize=chunksize):
+                    batches_done += 1
+                    rows_done += len(out_rows)
+                    if batches_done == 1:
+                        print(
+                            f"Phase-1: first batch ({len(out_rows)} rows) in {time.time() - t_pool:.1f}s "
+                            f"— progress bar will advance now",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    writer.writerows(out_rows)
+                    if progress_bar is not None:
+                        progress_bar.update(len(out_rows))
+                    pending_flush += len(out_rows)
+                    if pending_flush >= 2048:
+                        out_f.flush()
+                        pending_flush = 0
+            except Exception as e:
+                print(f"Phase-1: Exception during pool execution: {e}", file=sys.stderr, flush=True)
+                pool.terminate()
+                raise
+            finally:
+                # 显式关闭并等待进程池结束
+                pool.close()
+                pool.join()
         if progress_bar is not None:
             progress_bar.close()
 
