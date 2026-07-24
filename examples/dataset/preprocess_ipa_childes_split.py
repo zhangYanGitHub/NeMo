@@ -1113,13 +1113,15 @@ def process_raw_batch(
 def recommend_diacritize_workers(cpu_count: int) -> int:
     """Arabic phase-1 is tashkeel-bound (ONNX).
 
-    Each worker loads rules + tashkeel; beyond ~4–8 workers memory and ONNX contention
-    usually dominate (especially on macOS spawn). Cap parallelism accordingly.
+    Since we force single-threaded ONNX (OMP_NUM_THREADS=1), we can scale the number
+    of workers linearly with the physical CPU cores to maximize throughput, leaving
+    a small headroom for the OS and IO.
     """
     cpu_count = max(1, cpu_count)
     if cpu_count <= 4:
         return cpu_count
-    return min(8, max(4, cpu_count // 2))
+    # Leave 2 cores for OS/IO, use the rest for ONNX workers
+    return max(4, cpu_count - 2)
 
 
 def recommend_diacritize_chunksize(workers: int) -> int:
@@ -1248,6 +1250,9 @@ def run_diacritize_phase(
                 if pending_flush >= 2048:
                     out_f.flush()
                     pending_flush = 0
+            # 显式关闭并等待进程池结束
+            pool.close()
+            pool.join()
         if progress_bar is not None:
             progress_bar.close()
 
