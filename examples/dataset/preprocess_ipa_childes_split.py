@@ -5,6 +5,7 @@ import argparse
 import csv
 import functools
 import json
+import multiprocessing as mp
 import os
 import re
 import sys
@@ -12,12 +13,12 @@ import unicodedata
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from text_normalize import normalize_for_g2p
 from tqdm import tqdm
 
-from ar_XA.diacritizer_frontend import diacritize_arabic_line, is_arabic_voice
+from ar_XA.diacritizer_frontend import diacritize_arabic_line, get_local_nav_diacritizer, is_arabic_voice
 
 ZWJ = "\u200d"
 TIES = {ZWJ, "\u0361", "\u035c"}
@@ -27,6 +28,9 @@ STRESS = {PRIMARY_STRESS, SECONDARY_STRESS}
 LENGTH = "\u02d0"  # ː
 SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
+# Arabic phase-1: small batches balance slow tashkeel rows across workers.
+AR_DIACRITIZE_BATCH_SIZE = 8
+AR_DIACRITIZED_CACHE_SUFFIX = ".diacritized.csv"
 
 # EVERYTHING language-specific (espeak voice, number-normalization locale, the multi-character
 # phoneme atom whitelist, and the self-check regression cases) lives in lang_config.json, NOT
@@ -466,6 +470,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override latin_letter_readings JSON (default: ar_XA/resources/latin_letter_readings_ar_XA.json).",
     )
+    parser.add_argument(
+        "--diacritized-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Skip Arabic phase-1 diacritization and phonemize from this pre-diacritized CSV "
+            "(same columns as --input-csv). Implies --no-diacritize-arabic for the phonemize step."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-diacritize-cache",
+        action="store_true",
+        help=(
+            "Re-run Arabic phase-1 diacritization even when a cached "
+            "<input_stem>.diacritized.csv exists under --output-dir."
+        ),
+    )
     parser.add_argument("--manifest-name", type=str, default="train.json")
     parser.add_argument("--phoneme-vocab-name", type=str, default="phoneme_vocab.txt")
     parser.add_argument("--grapheme-vocab-name", type=str, default="grapheme_vocab.txt")
@@ -601,6 +622,27 @@ def _pool_worker_init_diacritizer(
     get_local_nav_diacritizer(rules_path, letter_map_path)
 
 
+@functools.lru_cache(maxsize=131072)
+def _diacritize_line_cached(
+    raw: str,
+    rules_path: Optional[str],
+    letter_map_path: Optional[str],
+) -> str:
+    """Per-worker LRU cache for identical Arabic lines (common in navigation POI data)."""
+    return diacritize_arabic_line(raw, rules_path=rules_path, letter_map_path=letter_map_path)
+
+
+def _diacritize_pool_context(
+    executor_name: str,
+    rules_s: Optional[str],
+    letter_s: Optional[str],
+) -> Tuple[Optional[mp.context.BaseContext], Optional[Callable], Tuple]:
+    """Return (mp_context, pool_initializer, pool_initargs) for Arabic diacritizer workers."""
+    if executor_name == "process" and sys.platform == "linux":
+        return mp.get_context("fork"), None, ()
+    return None, _pool_worker_init_diacritizer, (rules_s, letter_s)
+
+
 def _prepare_row_segments(
     lang: str,
     raw: str,
@@ -644,6 +686,18 @@ def iter_csv_raw_rows(
     limit: int,
 ) -> Iterator[Tuple[str, str]]:
     """Fast CSV reader: yield ``(lang, raw_text)`` without diacritize/TN (done in workers)."""
+    for row, text_idx, lang_idx in iter_csv_record_rows(csv_path, text_field, lang_field, limit):
+        lang = row[lang_idx].strip() if lang_idx < len(row) else ""
+        yield lang, row[text_idx]
+
+
+def iter_csv_record_rows(
+    csv_path: Path,
+    text_field: str,
+    lang_field: str,
+    limit: int,
+) -> Iterator[Tuple[List[str], int, int]]:
+    """Yield ``(row, text_idx, lang_idx)`` preserving the full CSV record."""
     seen = 0
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
@@ -663,8 +717,7 @@ def iter_csv_raw_rows(
             raw = row[text_idx]
             if not raw or not raw.strip():
                 continue
-            lang = row[lang_idx].strip() if lang_idx < len(row) else ""
-            yield (lang, raw)
+            yield row, text_idx, lang_idx
             seen += 1
             if limit > 0 and seen >= limit:
                 return
@@ -733,16 +786,17 @@ def approx_csv_body_line_count(csv_path: Path) -> int:
     return max(0, n_newlines - 1)
 
 
-def ordered_process_batches(
+def ordered_map_batches(
     executor: Executor,
     max_in_flight: int,
     batches_iter: Iterator[List],
     process_fn,
-) -> Iterator[List[Tuple[str, str, List[str]]]]:
-    """Like executor.map(process_fn, ...) but submit only max_in_flight tasks ahead; preserve order."""
+    on_batch_complete: Optional[Callable[[], None]] = None,
+):
+    """Submit batch jobs with bounded in-flight work; yield results in input order."""
     it = enumerate(batches_iter)
     pending: dict = {}
-    saved: dict[int, List[Tuple[str, str, List[str]]]] = {}
+    saved: dict = {}
     next_emit = 0
     exhausted = False
 
@@ -757,7 +811,7 @@ def ordered_process_batches(
             fut = executor.submit(process_fn, batch)
             pending[fut] = idx
 
-    def emit_ready() -> Iterator[List[Tuple[str, str, List[str]]]]:
+    def emit_ready():
         nonlocal next_emit
         while next_emit in saved:
             yield saved.pop(next_emit)
@@ -770,10 +824,23 @@ def ordered_process_batches(
             for fut in done:
                 idx = pending.pop(fut)
                 saved[idx] = fut.result()
+                if on_batch_complete is not None:
+                    on_batch_complete()
         yield from emit_ready()
         if exhausted and not pending and not saved:
             break
         fill_pending()
+
+
+def ordered_process_batches(
+    executor: Executor,
+    max_in_flight: int,
+    batches_iter: Iterator[List],
+    process_fn,
+    on_batch_complete: Optional[Callable[[], None]] = None,
+) -> Iterator[List[Tuple[str, str, List[str]]]]:
+    """Like executor.map(process_fn, ...) but submit only max_in_flight tasks ahead; preserve order."""
+    yield from ordered_map_batches(executor, max_in_flight, batches_iter, process_fn, on_batch_complete)
 
 
 def process_batch(
@@ -890,6 +957,106 @@ def process_raw_batch(
     )
 
 
+def diacritize_records_batch(
+    batch_items: Sequence[Tuple[List[str], int, int]],
+    default_voice: str,
+    diacritizer_rules: Optional[str],
+    diacritizer_letter_map: Optional[str],
+) -> List[List[str]]:
+    """Arabic phase-1: diacritize text column for Arabic-voice rows; other rows pass through."""
+    out_rows: List[List[str]] = []
+    for row, text_idx, lang_idx in batch_items:
+        lang = row[lang_idx].strip() if lang_idx < len(row) else ""
+        if is_arabic_voice(lang or default_voice):
+            new_row = list(row)
+            new_row[text_idx] = _diacritize_line_cached(row[text_idx], diacritizer_rules, diacritizer_letter_map)
+            out_rows.append(new_row)
+        else:
+            out_rows.append(row)
+    return out_rows
+
+
+def run_diacritize_phase(
+    input_csv: Path,
+    output_csv: Path,
+    text_field: str,
+    lang_field: str,
+    limit: int,
+    default_voice: str,
+    rules_s: Optional[str],
+    letter_s: Optional[str],
+    workers: int,
+    executor_name: str,
+    show_progress: bool,
+) -> None:
+    """Phase 1 (Arabic only): parallel diacritization with per-worker cache; write a reusable CSV."""
+    get_local_nav_diacritizer(rules_s, letter_s)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with input_csv.open("r", encoding="utf-8", newline="") as src:
+        reader = csv.reader(src)
+        header = next(reader)
+
+    record_iter = iter_csv_record_rows(input_csv, text_field, lang_field, limit)
+    if show_progress:
+        if limit > 0:
+            est_rows = limit
+        else:
+            est_rows = approx_csv_body_line_count(input_csv)
+        est_batches = max(1, (est_rows + AR_DIACRITIZE_BATCH_SIZE - 1) // AR_DIACRITIZE_BATCH_SIZE)
+        print(
+            f"Arabic phase-1 diacritization: {est_rows} rows -> {output_csv.name}",
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        est_batches = None
+
+    batch_iter = iter_batches(
+        ((row, text_idx, lang_idx) for row, text_idx, lang_idx in record_iter),
+        AR_DIACRITIZE_BATCH_SIZE,
+    )
+    diacritize_fn = functools.partial(
+        diacritize_records_batch,
+        default_voice=default_voice,
+        diacritizer_rules=rules_s,
+        diacritizer_letter_map=letter_s,
+    )
+
+    mp_context, pool_initializer, pool_initargs = _diacritize_pool_context(executor_name, rules_s, letter_s)
+    executor_cls = ProcessPoolExecutor if executor_name == "process" else ThreadPoolExecutor
+    executor_kwargs = {"max_workers": workers, "initializer": pool_initializer, "initargs": pool_initargs}
+    if mp_context is not None:
+        executor_kwargs["mp_context"] = mp_context
+
+    with output_csv.open("w", encoding="utf-8", newline="") as out_f:
+        writer = csv.writer(out_f)
+        writer.writerow(header)
+        with executor_cls(**executor_kwargs) as executor:
+            progress_bar = None
+            if show_progress:
+                progress_bar = tqdm(
+                    total=est_batches,
+                    desc="Diacritize",
+                    unit="batch",
+                    dynamic_ncols=True,
+                    mininterval=0.25,
+                    disable=False,
+                    file=sys.stderr,
+                )
+            for batch_rows in ordered_map_batches(
+                executor,
+                max(1, workers * 4),
+                batch_iter,
+                diacritize_fn,
+                on_batch_complete=(progress_bar.update if progress_bar is not None else None),
+            ):
+                writer.writerows(batch_rows)
+            if progress_bar is not None:
+                progress_bar.close()
+
+    print(f"Wrote diacritized cache: {output_csv}", flush=True)
+
+
 def write_vocab(path: Path, tokens: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -959,10 +1126,8 @@ def main() -> None:
     auto_workers, auto_batch_size = recommend_runtime(cpu_count)
     workers = args.workers if args.workers > 0 else auto_workers
     batch_size = args.batch_size if args.batch_size > 0 else auto_batch_size
-    if diacritize_arabic and args.batch_size <= 0:
-        # Smaller raw-row batches -> more parallel diacritize jobs; phonemize still batched per worker.
-        batch_size = min(batch_size, 256)
-    executor_cls = ProcessPoolExecutor if args.executor == "process" else ThreadPoolExecutor
+    executor_name = args.executor
+    executor_cls = ProcessPoolExecutor if executor_name == "process" else ThreadPoolExecutor
 
     # Splitting always yields punctuation-free segments, so the phoneme-side defensive
     # filter must run whenever either stripping or splitting is on.
@@ -970,6 +1135,33 @@ def main() -> None:
 
     rules_s = str(diacritizer_rules) if diacritizer_rules else None
     letter_s = str(diacritizer_letter_map) if diacritizer_letter_map else None
+
+    phonemize_csv = input_csv
+    run_ar_diacritize_phase = diacritize_arabic and args.diacritized_csv is None
+    if args.diacritized_csv is not None:
+        phonemize_csv = args.diacritized_csv.expanduser().resolve()
+        print(f"Using pre-diacritized CSV for phonemize: {phonemize_csv}", flush=True)
+    elif run_ar_diacritize_phase:
+        cache_csv = output_dir / f"{input_csv.stem}{AR_DIACRITIZED_CACHE_SUFFIX}"
+        if not cache_csv.exists() or args.refresh_diacritize_cache:
+            run_diacritize_phase(
+                input_csv=input_csv,
+                output_csv=cache_csv,
+                text_field=args.text_field,
+                lang_field=args.lang_field,
+                limit=args.limit,
+                default_voice=default_voice,
+                rules_s=rules_s,
+                letter_s=letter_s,
+                workers=workers,
+                executor_name=executor_name,
+                show_progress=args.show_progress,
+            )
+        else:
+            print(f"Reusing diacritized cache: {cache_csv}", flush=True)
+        phonemize_csv = cache_csv
+
+    # Phase 2 (all languages): TN + segment + espeak phonemize — same path for en/de/fr/ar.
     process_fn = functools.partial(
         process_raw_batch,
         default_voice=default_voice,
@@ -979,29 +1171,20 @@ def main() -> None:
         phoneme_strip_punct=effective_strip,
         normalize_nums=args.normalize_numbers,
         number_locale=profile.number_locale,
-        diacritize_arabic=diacritize_arabic,
-        diacritizer_rules=rules_s,
-        diacritizer_letter_map=letter_s,
+        diacritize_arabic=False,
+        diacritizer_rules=None,
+        diacritizer_letter_map=None,
         inventories=inventories,
         phone_sets=phone_sets,
         grapheme_sets=grapheme_sets,
     )
-    pool_initializer = None
-    pool_initargs: Tuple = ()
-    if diacritize_arabic:
-        pool_initializer = _pool_worker_init_diacritizer
-        pool_initargs = (rules_s, letter_s)
-        print(
-            "Arabic diacritization: rules preloaded per worker; diacritize+phonemize run in parallel.",
-            flush=True,
-        )
 
     if args.show_progress:
         print("Preprocess: counting newlines in CSV for tqdm total…", file=sys.stderr, flush=True)
         if args.limit > 0:
             est_rows = args.limit
         else:
-            est_rows = approx_csv_body_line_count(input_csv)
+            est_rows = approx_csv_body_line_count(phonemize_csv)
         est_batches = max(1, (est_rows + batch_size - 1) // batch_size) if est_rows > 0 else None
     else:
         est_batches = None
@@ -1021,29 +1204,30 @@ def main() -> None:
         manifest_buffer = []
 
     batch_iter = iter_batches(
-        iter_csv_raw_rows(input_csv, args.text_field, args.lang_field, args.limit),
+        iter_csv_raw_rows(phonemize_csv, args.text_field, args.lang_field, args.limit),
         batch_size,
     )
 
     with manifest_path.open("w", encoding="utf-8") as manifest_f:
-        with executor_cls(max_workers=workers, initializer=pool_initializer, initargs=pool_initargs) as executor:
-            ordered = ordered_process_batches(
-                executor,
-                max(1, workers * 2),
-                batch_iter,
-                process_fn,
-            )
+        with executor_cls(max_workers=workers) as executor:
+            progress_bar = None
             if args.show_progress:
-                ordered = tqdm(
-                    ordered,
+                progress_bar = tqdm(
+                    total=est_batches,
                     desc="Preprocess",
                     unit="batch",
-                    total=est_batches,
                     dynamic_ncols=True,
                     mininterval=0.25,
                     disable=False,
                     file=sys.stderr,
                 )
+            ordered = ordered_process_batches(
+                executor,
+                max(1, workers * 2),
+                batch_iter,
+                process_fn,
+                on_batch_complete=(progress_bar.update if progress_bar is not None else None),
+            )
 
             for processed in ordered:
                 for text, phoneme_text, atoms in processed:
@@ -1060,6 +1244,9 @@ def main() -> None:
                     processed_rows += 1
                     if len(manifest_buffer) >= MANIFEST_WRITE_BUFFER_LINES:
                         flush_manifest_buffer(manifest_f)
+
+            if progress_bar is not None:
+                progress_bar.close()
 
             flush_manifest_buffer(manifest_f)
 
@@ -1090,6 +1277,8 @@ def main() -> None:
     dropped_rows = seen_rows - processed_rows
     drop_pct = (100.0 * dropped_rows / seen_rows) if seen_rows else 0.0
     print(f"Input CSV: {input_csv}")
+    if phonemize_csv != input_csv:
+        print(f"Phonemize CSV: {phonemize_csv}")
     print(f"Processed rows: {processed_rows}")
     print(
         f"Phoneme-gate dropped rows: {dropped_rows} / {seen_rows} ({drop_pct:.2f}%) "
