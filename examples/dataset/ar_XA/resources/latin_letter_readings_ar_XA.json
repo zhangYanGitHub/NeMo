@@ -1,0 +1,39 @@
+{
+  "description": "Arabic-script readings for Latin A-Z in ar_XA navigation text. These readings are intended for TTS training and inference text normalization; Latin letters should be converted to these forms before synthesis/training.",
+  "locale": "ar_XA",
+  "style": "conservative_standard_arabic_characters",
+  "letters": {
+    "A": "إِيه",
+    "B": "بِي",
+    "C": "سِي",
+    "D": "دِي",
+    "E": "إِي",
+    "F": "إِفْ",
+    "G": "جِي",
+    "H": "إِتْشْ",
+    "I": "آي",
+    "J": "جَيْ",
+    "K": "كَيْ",
+    "L": "إِلْ",
+    "M": "إِمْ",
+    "N": "إِنْ",
+    "O": "أُو",
+    "P": "بِي",
+    "Q": "كْيُو",
+    "R": "آرْ",
+    "S": "إِسْ",
+    "T": "تِي",
+    "U": "يُو",
+    "V": "فِي",
+    "W": "دَبْلْ يُو",
+    "X": "إِكْسْ",
+    "Y": "وَاي",
+    "Z": "زِدْ"
+  },
+  "notes": [
+    "P is mapped to بِي because standard Arabic does not have a native /p/ phoneme.",
+    "V is mapped to فِي because standard Arabic does not have a native /v/ phoneme.",
+    "Z uses زِدْ for a broader Arabic-local navigation reading rather than the US-only zee reading.",
+    "Each navigation utterance should contain at most one letter reading unless a later dataset explicitly targets multi-letter names."
+  ]
+}

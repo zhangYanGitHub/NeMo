@@ -66,7 +66,14 @@ import onnxruntime
 # 单一真源：训练/推理共用的文本前端（与 NeMo examples/dataset/text_normalize.py 逐字对齐）。
 # 客户端不再自实现 normalize_graphemes（旧的导航英文 TN，与训练不一致），改用此模块，
 # 从而保证 train==serve（数字/符号 TN 按 locale、标点剥离、按停顿切段完全一致）。
-from g2p_text_frontend import normalize_for_g2p, number_locale_for
+from g2p_text_frontend import (
+    is_arabic_g2p_lang,
+    normalize_for_g2p,
+    number_locale_for,
+    phonemize_arabic_with_letter_lexicon,
+    prepare_arabic_grapheme_text,
+    split_arabic_latin_segments,
+)
 
 try:
     from tqdm import tqdm
@@ -710,6 +717,14 @@ class G2pNemoCtcClient:
             print(f"  ORT providers={providers} batch={self.batch_size}", flush=True)
 
     def phonemize_ipa_one(self, text: str, g2p_lang_tag: str = "en-US") -> str:
+        number_locale = number_locale_for(g2p_lang_tag)
+        if is_arabic_g2p_lang(g2p_lang_tag):
+            return phonemize_arabic_with_letter_lexicon(
+                text,
+                lambda seg: self._phonemize_chunk([seg], number_locale, diacritize_arabic=False)[0],
+                locale=number_locale,
+                diacritize=True,
+            )
         return self.phonemize_ipa_batch([text], g2p_lang_tag, show_progress=False)[0]
 
     def phonemize_ipa_batch(
@@ -743,15 +758,25 @@ class G2pNemoCtcClient:
             results.extend(self._phonemize_chunk(chunk, number_locale))
         return results
 
-    def _phonemize_chunk(self, texts: list[str], number_locale: str = "en") -> list[str]:
+    def _phonemize_chunk(
+        self,
+        texts: list[str],
+        number_locale: str = "en",
+        *,
+        diacritize_arabic: Optional[bool] = None,
+    ) -> list[str]:
         rows: list[list[int]] = []
         lens: list[int] = []
+        if diacritize_arabic is None:
+            diacritize_arabic = number_locale == "ar"
         for t in texts:
-            # 阶段A：与训练前端逐字一致的数字/符号 TN（g2p_text_frontend.normalize_for_g2p，
-            # 真源 = examples/dataset/text_normalize.py）。对已切好的 segment 幂等（无数字/符号
-            # 时原样返回），故与调用方先 text_to_segments 再喂本客户端的用法可安全叠加。
+            # 阶段A：与训练前端逐字一致的 TN。阿语先走 local_nav_diacritizer（与 preprocess
+            # --diacritize-arabic 默认开启一致），再 normalize_for_g2p。
             if self._normalize_input:
-                t = normalize_for_g2p(t, number_locale)
+                if diacritize_arabic:
+                    t = prepare_arabic_grapheme_text(t, diacritize=True)
+                else:
+                    t = normalize_for_g2p(t, number_locale)
             # 阶段B：do_lower + 字符级 text_to_ids + max_source_len 截断（原有逻辑）。
             ids = grapheme_text_to_ids(
                 t,

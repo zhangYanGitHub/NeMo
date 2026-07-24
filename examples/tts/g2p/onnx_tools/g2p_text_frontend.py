@@ -20,9 +20,18 @@ train vs serve time.
 """
 from __future__ import annotations
 
+import json
 import re
+import sys
 import unicodedata
-from typing import List
+from pathlib import Path
+from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
+
+_DATASET_ROOT = Path(__file__).resolve().parents[3] / "dataset"
+if str(_DATASET_ROOT) not in sys.path:
+    sys.path.insert(0, str(_DATASET_ROOT))
+
+from ar_XA.diacritizer_frontend import diacritize_arabic_line, is_arabic_voice
 
 # ── number / code TN (BYTE-FOR-BYTE mirror of examples/dataset/text_normalize.py) ─
 # Any edit here MUST be mirrored in text_normalize.normalize_for_g2p (and vice versa),
@@ -306,6 +315,10 @@ def normalize_for_g2p(text: str, locale: str = "en") -> str:
         return text
 
     text = normalize_hyphens(text)
+    # Arabic G2P training keeps Western digits in graphemes (normalize_numbers=false).
+    if locale == "ar":
+        return " ".join(text.split())
+
     text = _expand_symbols(text, locale)
 
     if not any(ch.isdigit() for ch in text):
@@ -341,12 +354,31 @@ def split_into_segments(text: str) -> List[str]:
     return segments
 
 
-def text_to_segments(text: str, locale: str = "en") -> List[str]:
+def prepare_arabic_grapheme_text(text: str, *, diacritize: bool = True) -> str:
+    """Arabic train==serve: diacritizer (incl. letter→Arabic) then NFC whitespace + ar TN."""
+    if diacritize:
+        text = diacritize_arabic_line(text)
+    text = normalize_text(text)
+    return normalize_for_g2p(text, "ar")
+
+
+def text_to_segments(
+    text: str,
+    locale: str = "en",
+    *,
+    diacritize_arabic: Optional[bool] = None,
+) -> List[str]:
     """Full inference frontend == training data prep:
-    normalize_text -> normalize_for_g2p(locale) -> split_into_segments.
+    normalize_text -> [ar: local_nav_diacritizer] -> normalize_for_g2p(locale) -> split_into_segments.
     Returns the punctuation-free, TN'd segments to send to the model one by one.
-    locale ('en'/'de'/'fr') MUST match lang_config.json's number_locale for the language."""
-    return split_into_segments(normalize_for_g2p(normalize_text(text), locale))
+    locale ('en'/'de'/'fr'/'ar') MUST match lang_config.json's number_locale for the language."""
+    if diacritize_arabic is None:
+        diacritize_arabic = locale == "ar"
+    if diacritize_arabic and locale == "ar":
+        text = prepare_arabic_grapheme_text(text, diacritize=True)
+    else:
+        text = normalize_for_g2p(normalize_text(text), locale)
+    return split_into_segments(text)
 
 
 # locale (BCP-47-ish tag or config key) -> number_locale used by normalize_for_g2p.
@@ -355,7 +387,103 @@ _NUMBER_LOCALE_BY_LANG = {
     "en": "en", "en-us": "en", "en_us": "en", "en-gb": "en",
     "de": "de", "de-de": "de", "de_de": "de", "de-at": "de", "de-ch": "de",
     "fr": "fr", "fr-fr": "fr", "fr_fr": "fr", "fr-be": "fr", "fr-ch": "fr", "fr-ca": "fr",
+    "ar": "ar", "ar-xa": "ar", "ar_xa": "ar",
 }
+
+
+def is_arabic_g2p_lang(lang: str) -> bool:
+    """True for ar / ar_XA / ar-JO style tags (G2P uses letter-lexicon split path)."""
+    if not lang:
+        return False
+    key = lang.strip().lower().replace("_", "-")
+    if key in ("ar", "ar-xa"):
+        return True
+    return key.startswith("ar-")
+
+
+# Latin letter runs in otherwise Arabic navigation text (إثنان A, GPS→handled elsewhere).
+_LATIN_LETTER_RUN_RE = re.compile(r"[A-Za-z]+")
+
+# Default letter-name IPA lexicon (scheme 2: letters NOT in G2P model; product frontend only).
+_DEFAULT_AR_LETTER_LEXICON_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "dataset/prepare/config/ar_XA/letter_pronunciation_lexicon.json"
+)
+
+_ar_letter_lexicon_cache: Optional[Dict[str, str]] = None
+
+
+def load_ar_letter_lexicon(path: Optional[Path] = None) -> Dict[str, str]:
+    """Load A–Z -> IPA string map from letter_pronunciation_lexicon.json."""
+    global _ar_letter_lexicon_cache
+    p = Path(path).expanduser().resolve() if path else _DEFAULT_AR_LETTER_LEXICON_PATH
+    if _ar_letter_lexicon_cache is not None and (path is None):
+        return _ar_letter_lexicon_cache
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    letters = raw.get("letters") or {}
+    out = {str(k).upper(): str(v).strip() for k, v in letters.items() if k and v}
+    if path is None:
+        _ar_letter_lexicon_cache = out
+    return out
+
+
+def split_arabic_latin_segments(text: str) -> List[Tuple[str, Literal["g2p", "letter"]]]:
+    """Split mixed Arabic+Latin text into ordered G2P vs single-letter tokens.
+
+    Example: ``"اتجه إلى المخرج إثنان A"`` →
+      ``[("اتجه إلى المخرج إثنان ", "g2p"), ("A", "letter")]``.
+    Consecutive Latin letters are split one-by-one (``AB`` → ``A``, ``B``).
+    """
+    text = normalize_text(text)
+    if not text:
+        return []
+    if not _LATIN_LETTER_RUN_RE.search(text):
+        return [(text, "g2p")]
+    out: List[Tuple[str, Literal["g2p", "letter"]]] = []
+    pos = 0
+    for m in _LATIN_LETTER_RUN_RE.finditer(text):
+        if m.start() > pos:
+            out.append((text[pos : m.start()], "g2p"))
+        for ch in m.group(0):
+            out.append((ch.upper(), "letter"))
+        pos = m.end()
+    if pos < len(text):
+        out.append((text[pos:], "g2p"))
+    return out
+
+
+def phonemize_arabic_with_letter_lexicon(
+    text: str,
+    g2p_phonemize: Callable[[str], str],
+    *,
+    letter_lexicon: Optional[Dict[str, str]] = None,
+    locale: str = "ar",
+    diacritize: bool = True,
+) -> str:
+    """Scheme 2 inference: diacritize (incl. Latin->Arabic), G2P segments + lexicon fallback.
+
+    *g2p_phonemize* should run the Arabic G2P model on one punctuation-free segment
+    (caller typically wraps ``text_to_segments`` + ONNX client).
+    """
+    if diacritize and is_arabic_g2p_lang(locale):
+        text = prepare_arabic_grapheme_text(text, diacritize=True)
+    lex = letter_lexicon if letter_lexicon is not None else load_ar_letter_lexicon()
+    parts: List[str] = []
+    for piece, kind in split_arabic_latin_segments(text):
+        if kind == "letter":
+            ipa = lex.get(piece.upper())
+            if not ipa:
+                raise KeyError(f"No letter pronunciation for {piece!r} in Arabic letter lexicon")
+            parts.append(ipa)
+            continue
+        piece = piece.strip()
+        if not piece:
+            continue
+        for seg in text_to_segments(piece, locale=locale, diacritize_arabic=False):
+            ipa = g2p_phonemize(seg)
+            if ipa:
+                parts.append(ipa)
+    return " ".join(parts)
 
 
 def number_locale_for(lang: str) -> str:

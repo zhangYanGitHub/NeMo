@@ -1,0 +1,5 @@
+{
+  "_comment": "Same experiment as vivid-ai-app-tntts-training/run_ar_XA_diacritized.sh (exp1_all_train_test_all_min_conf_0.6_ngram_with_punct). Paths are relative to this file's directory.",
+  "rules": "resources/nav_diacritizer_rules.json",
+  "letter_map": "resources/latin_letter_readings_ar_XA.json"
+}

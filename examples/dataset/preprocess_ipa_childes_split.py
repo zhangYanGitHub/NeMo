@@ -12,10 +12,12 @@ import unicodedata
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Dict, Iterator, List, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from text_normalize import normalize_for_g2p
 from tqdm import tqdm
+
+from ar_XA.diacritizer_frontend import diacritize_arabic_line, is_arabic_voice
 
 ZWJ = "\u200d"
 TIES = {ZWJ, "\u0361", "\u035c"}
@@ -134,6 +136,18 @@ def build_voice_phone_sets(profiles: Dict[str, LanguageProfile]) -> Dict[str, Se
         if prof.phoneme_inventory:
             out[prof.voice] = set(prof.phoneme_inventory) | set(prof.multi_char_phonemes)
     return out
+
+
+def build_voice_grapheme_sets(profiles: Dict[str, LanguageProfile]) -> Dict[str, frozenset]:
+    """{voice_code: grapheme_inventory} for per-row grapheme whitelist gating."""
+    return {prof.voice: prof.grapheme_inventory for prof in profiles.values() if prof.grapheme_inventory}
+
+
+def graphemes_in_inventory(text: str, allowed: frozenset) -> bool:
+    """True when every codepoint in *text* is in the language grapheme_inventory."""
+    if not allowed:
+        return True
+    return all(ch in allowed for ch in text)
 
 
 def _atom_base(atom: str) -> str:
@@ -430,6 +444,28 @@ def parse_args() -> argparse.Namespace:
             "would be dropped). MUST be applied identically in the inference frontend."
         ),
     )
+    parser.add_argument(
+        "--diacritize-arabic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Apply ar_XA local_nav_diacritizer (navigation rules + tashkeel fallback) "
+            "before phonemizing. Default: on when --language is 'ar'. MUST match the "
+            "inference frontend when training Arabic G2P."
+        ),
+    )
+    parser.add_argument(
+        "--diacritizer-rules",
+        type=Path,
+        default=None,
+        help="Override nav_diacritizer rules.json (default: ar_XA/resources/nav_diacritizer_rules.json).",
+    )
+    parser.add_argument(
+        "--diacritizer-letter-map",
+        type=Path,
+        default=None,
+        help="Override latin_letter_readings JSON (default: ar_XA/resources/latin_letter_readings_ar_XA.json).",
+    )
     parser.add_argument("--manifest-name", type=str, default="train.json")
     parser.add_argument("--phoneme-vocab-name", type=str, default="phoneme_vocab.txt")
     parser.add_argument("--grapheme-vocab-name", type=str, default="grapheme_vocab.txt")
@@ -564,6 +600,10 @@ def iter_csv_rows(
     split_punct: bool = False,
     normalize_nums: bool = False,
     number_locale: str = "en",
+    diacritize_arabic: bool = False,
+    default_voice: str = "",
+    diacritizer_rules: Optional[Path] = None,
+    diacritizer_letter_map: Optional[Path] = None,
 ) -> Iterator[Tuple[str, str, str]]:
     """Yield ``(lang, grapheme_text, phonemize_text)`` triples.
 
@@ -587,15 +627,23 @@ def iter_csv_rows(
         for row in reader:
             if text_idx >= len(row):
                 continue
-            raw = normalize_text(row[text_idx])
-            if not raw:
+            raw = row[text_idx]
+            if not raw or not raw.strip():
                 continue
             lang = row[lang_idx].strip() if lang_idx < len(row) else ""
+            raw_for_row = raw
+            if diacritize_arabic and is_arabic_voice(lang or default_voice):
+                raw_for_row = diacritize_arabic_line(
+                    raw,
+                    rules_path=str(diacritizer_rules) if diacritizer_rules else None,
+                    letter_map_path=str(diacritizer_letter_map) if diacritizer_letter_map else None,
+                )
 
             # Grapheme input and phonemize input are the same normalized text
             # (no letter-"A" / "A-" special-casing): the model sees exactly the
             # text espeak phonemizes into the target.
-            text = normalize_for_g2p(raw, locale=number_locale) if normalize_nums else raw
+            text = normalize_for_g2p(raw_for_row, locale=number_locale) if normalize_nums else raw_for_row
+            text = normalize_text(text)
 
             if split_punct:
                 segs = split_into_segments(text)
@@ -644,10 +692,12 @@ def ordered_process_batches(
     strip_punct: bool = False,
     inventories: Dict[str, Tuple[str, ...]] = None,
     phone_sets: Dict[str, Set[str]] = None,
+    grapheme_sets: Dict[str, frozenset] = None,
 ) -> Iterator[List[Tuple[str, str, List[str]]]]:
     """Like executor.map(process_batch, ...) but submit only max_in_flight tasks ahead; preserve order."""
     inventories = inventories or {}
     phone_sets = phone_sets or {}
+    grapheme_sets = grapheme_sets or {}
     it = enumerate(batches_iter)
     pending: dict = {}
     saved: dict[int, List[Tuple[str, str, List[str]]]] = {}
@@ -663,7 +713,7 @@ def ordered_process_batches(
                 exhausted = True
                 return
             fut = executor.submit(
-                process_batch, batch, default_voice, stress_mode, strip_punct, inventories, phone_sets
+                process_batch, batch, default_voice, stress_mode, strip_punct, inventories, phone_sets, grapheme_sets
             )
             pending[fut] = idx
 
@@ -693,6 +743,7 @@ def process_batch(
     strip_punct: bool = False,
     inventories: Dict[str, Tuple[str, ...]] = None,
     phone_sets: Dict[str, Set[str]] = None,
+    grapheme_sets: Dict[str, frozenset] = None,
 ) -> List[Tuple[str, str, List[str]]]:
     """Phonemize a batch of (lang, grapheme_text, phonemize_text) rows.
 
@@ -701,18 +752,23 @@ def process_batch(
     and atom_tokens is the flat list of atomic phoneme units for building the phoneme vocab.
 
     音素级净化闸门（保证 text 侧只含目标语言音素）：整行丢弃（回填空三元组，main 会跳过）当
+      * 字素含 grapheme_inventory 之外的字符（如方案二阿语训练集中的孤立拉丁字母）；
       * 输出含 '(' 语言切换标记（如 (en)…(de)）→ 该行含外语发音；
       * 任一原子基底不在该语言 phoneme_inventory 白名单内 → 混入的外语/杂音素。
     注：'?'（piper 无法映射的符号）已按需放开，视为合法原子保留，不丢行。
     """
     inventories = inventories or {}
     phone_sets = phone_sets or {}
+    grapheme_sets = grapheme_sets or {}
     results: List[Tuple[str, str, List[str]]] = [("", "", [])] * len(batch_rows)
     by_voice: dict[str, List[Tuple[int, str, str]]] = {}
     for i, (lang, grapheme, ph_text) in enumerate(batch_rows):
         voice = normalize_voice(lang) if lang else default_voice
         if not voice:
             voice = default_voice
+        allowed_g = grapheme_sets.get(voice) or grapheme_sets.get(voice.split("-", 1)[0]) or frozenset()
+        if not graphemes_in_inventory(grapheme, allowed_g):
+            continue
         by_voice.setdefault(voice, []).append((i, grapheme, ph_text))
 
     for voice, indexed_items in by_voice.items():
@@ -792,13 +848,22 @@ def main() -> None:
         )
     profile = profiles[language]
     default_voice = normalize_voice(args.default_voice) if args.default_voice else profile.voice
+    diacritize_arabic = args.diacritize_arabic
+    if diacritize_arabic is None:
+        diacritize_arabic = language == "ar"
+    diacritizer_rules = args.diacritizer_rules.expanduser().resolve() if args.diacritizer_rules else None
+    diacritizer_letter_map = (
+        args.diacritizer_letter_map.expanduser().resolve() if args.diacritizer_letter_map else None
+    )
     inventories = build_voice_inventories(profiles)
     phone_sets = build_voice_phone_sets(profiles)
+    grapheme_sets = build_voice_grapheme_sets(profiles)
     run_self_check(profile)
     print(
         f"Language config: {lang_config_path} "
         f"(languages: {sorted(profiles)}; active: {language!r}, "
-        f"voice: {profile.voice!r}, number locale: {profile.number_locale!r})"
+        f"voice: {profile.voice!r}, number locale: {profile.number_locale!r}, "
+        f"diacritize_arabic: {diacritize_arabic})"
     )
 
     manifest_path = output_dir / args.manifest_name
@@ -850,6 +915,10 @@ def main() -> None:
             args.split_on_punctuation,
             args.normalize_numbers,
             profile.number_locale,
+            diacritize_arabic,
+            default_voice,
+            diacritizer_rules,
+            diacritizer_letter_map,
         ),
         batch_size,
     )
@@ -865,6 +934,7 @@ def main() -> None:
                 effective_strip,
                 inventories,
                 phone_sets,
+                grapheme_sets,
             )
             if args.show_progress:
                 ordered = tqdm(

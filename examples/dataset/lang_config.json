@@ -68,7 +68,8 @@
     "(U+002D, piper map id 9) is listed here as a real phone: piper emits it as a proclitic/liaison",
     "marker on French function words (lə-/la-/də-…) and it flows into phoneme_ids, so the model must",
     "reproduce it. It is NOT stripped. Listing it lets those ~45% of French rows pass the inventory",
-    "gate instead of being dropped, while keeping the target identical to piper."
+    "gate instead of being dropped, while keeping the target identical to piper.",
+    "Arabic ('ar'): pure-Arabic G2P — Latin A–Z excluded from grapheme_inventory; letters handled at product frontend via letter_pronunciation_lexicon.json + concat. espeak-ng labels training data only. Preprocess: --language ar --no-normalize-numbers --text-field sentence --lang-field espeak_lang_code."
   ],
   "default_language": "de",
   "languages": {
@@ -133,6 +134,34 @@
         "judge": ["dʒˈʌdʒ", ["dʒ", "ˈʌ", "dʒ"]],
         "church": ["tʃˈɜːtʃ", ["tʃ", "ˈɜː", "tʃ"]],
         "palmyra": ["pˈɑːmˈaɪɹə", ["p", "ˈɑː", "m", "ˈaɪ", "ɹ", "ə"]]
+      }
+    },
+    "ar": {
+      "voice": "ar",
+      "number_locale": "en",
+      "diacritizer": {
+        "_note": "local_nav_diacritizer (vivid-ai-app-tntts-training run_ar_XA_diacritized.sh). Default resources under examples/dataset/ar_XA/resources/. Preprocess: --language ar (diacritize on by default). Inference: g2p_text_frontend.prepare_arabic_grapheme_text().",
+        "rules": "ar_XA/resources/nav_diacritizer_rules.json",
+        "letter_map": "ar_XA/resources/latin_letter_readings_ar_XA.json"
+      },
+      "multi_char_phonemes": ["dʒ", "tʃ", "s̪", "t̪", "ts"],
+      "phoneme_inventory": [
+        "a", "e", "i", "o", "u",
+        "b", "d", "f", "h", "j", "k", "l", "m", "n", "p", "q", "r", "s", "t", "v", "w", "x", "z",
+        "ð", "θ", "χ", "ħ", "ʕ", "ʔ", "ɣ", "ɡ", "ʃ", "ʒ", "ˤ",
+        ".", "-"
+      ],
+      "grapheme_inventory": "؀؁؂؃؄؅؆؇؈؉؊؋،؍؎؏ؘؙؚؐؑؒؓؔؕؖؗ؛؜؝؞؟ؠءآأؤإئابةتثجحخدذرزسشصضطظعغػؼؽؾؿـفقكلمنهوىيًٌٍَُِّْٕٖٜٟٓٔٗ٘ٙٚٛٝٞ٠١٢٣٤٥٦٧٨٩٪٫٬٭ٮٯٰٱٲٳٴٵٶٷٸٹٺٻټٽپٿڀځڂڃڄڅچڇڈډڊڋڌڍڎڏڐڑڒړڔڕږڗژڙښڛڜڝڞڟڠڡڢڣڤڥڦڧڨکڪګڬڭڮگڰڱڲڳڴڵڶڷڸڹںڻڼڽھڿۀہۂۃۄۅۆۇۈۉۊۋیۍێۏېۑےۓ۔ەۖۗۘۙۚۛۜ۝۞ۣ۟۠ۡۢۤۥۦۧۨ۩۪ۭ۫۬ۮۯ۰۱۲۳۴۵۶۷۸۹ۺۻۼ۽۾ۿݐݑݒݓݔݕݖݗݘݙݚݛݜݝݞݟݠݡݢݣݤݥݦݧݨݩݪݫݬݭݮݯݰݱݲݳݴݵݶݷݸݹݺݻݼݽݾݿࢠࢡࢢࢣࢤࢥࢦࢧࢨࢩࢪࢫࢬࢭࢮࢯࢰࢱࢲࢳࢴࢵࢶࢷࢸࢹࢺࢻࢼࢽࢾࢿࣀࣁࣂࣃࣄࣅࣆࣇࣈࣉ࣏࣐࣑࣒࣓࣊࣋࣌࣍࣎ࣔࣕࣖࣗࣘࣙࣚࣛࣜࣝࣞࣟ࣠࣡࣢ࣰࣱࣲࣣࣦࣩ࣭࣮࣯ࣶࣹࣺࣤࣥࣧࣨ࣪࣫࣬ࣳࣴࣵࣷࣸࣻࣼࣽࣾࣿ 0123456789.,!?;:\"'()-/&%+",
+      "self_check": {
+        "مرحبا": ["mrħbˈaː", ["m", "r", "ħ", "b", "ˈaː"]],
+        "الجذر": ["ʔaldʒˈiðr", ["ʔ", "a", "l", "dʒ", "ˈi", "ð", "r"]],
+        "خمسون": ["χˌumusˈuːna", ["χ", "ˌu", "m", "u", "s", "ˈuː", "n", "a"]],
+        "شكرا": ["ʃkrˈaː", ["ʃ", "k", "r", "ˈaː"]],
+        "واحد": ["wˈaːħid", ["w", "ˈaː", "ħ", "i", "d"]],
+        "جي": ["dʒˈiː", ["dʒ", "ˈiː"]],
+        "الضفة": ["ʔadˤdˤˈiffa", ["ʔ", "a", "d", "ˤ", "d", "ˤ", "ˈi", "f", "f", "a"]],
+        "البرنامج": ["ʔalba.rnˈaːmadʒ", ["ʔ", "a", "l", "b", "a", ".", "r", "n", "ˈaː", "m", "a", "dʒ"]],
+        "بيتسا": ["biːtsˌaː", ["b", "iː", "ts", "ˌaː"]]
       }
     }
   }
