@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -67,16 +68,25 @@ def _load_diacritizer_engine(rules_p: Path, letter_p: Path):
                 and cached_letter_mtime == letter_mtime
                 and cached_letter_key == letter_key
             ):
+                print(
+                    f"Diacritizer: loaded compiled engine from {cache_p.name}",
+                    flush=True,
+                )
                 return engine
         except (pickle.PickleError, EOFError, ValueError, TypeError):
             pass
 
+    print(f"Diacritizer: building engine from {rules_p.name} (first run; will write {cache_p.name})…", flush=True)
+    t0 = time.time()
     rules: Dict[str, Any] = json.loads(rules_p.read_text(encoding="utf-8"))
     letter_map = load_letter_map(letter_p)
     engine = LocalNavDiacritizer(rules, letter_map)
+    print(f"Diacritizer: engine built in {time.time() - t0:.1f}s", flush=True)
     try:
+        t1 = time.time()
         with cache_p.open("wb") as f:
             pickle.dump((rules_mtime, letter_mtime, letter_key, engine), f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Diacritizer: wrote {cache_p.name} in {time.time() - t1:.1f}s", flush=True)
     except OSError:
         pass
     return engine

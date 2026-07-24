@@ -8,8 +8,10 @@ import json
 import multiprocessing as mp
 import os
 import re
+import os
 import sqlite3
 import sys
+import time
 import unicodedata
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Executor, ProcessPoolExecutor, ThreadPoolExecutor, wait
@@ -31,7 +33,7 @@ SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
 # Arabic phase-1 (local_nav_diacritizer, ref. run_ar_XA_diacritized.sh):
 #   diacritize raw CSV -> cache; phase-2 does normalize_text + normalize_for_g2p + espeak.
-AR_DIACRITIZE_CHUNK_ROWS = 256
+AR_DIACRITIZE_CHUNK_ROWS = 64
 AR_DIACRITIZE_DEFAULT_CHUNKSIZE = 4
 AR_DIACRITIZE_LRU_SIZE = 262144
 AR_DIACRITIZED_CACHE_SUFFIX = ".diacritized.csv"
@@ -423,7 +425,13 @@ def parse_args() -> argparse.Namespace:
         "--diacritize-workers",
         type=int,
         default=0,
-        help="Arabic phase-1 workers; 0 means use all CPU cores (fastest for tashkeel)",
+        help="Arabic phase-1 workers; 0 means auto (typically 4–8 ONNX workers)",
+    )
+    parser.add_argument(
+        "--diacritize-chunk-rows",
+        type=int,
+        default=0,
+        help=f"Arabic phase-1 rows per worker task (progress granularity); 0 means {AR_DIACRITIZE_CHUNK_ROWS}",
     )
     parser.add_argument(
         "--diacritize-chunksize",
@@ -642,14 +650,22 @@ def _init_diacritize_worker(
     lookup_db_path: Optional[str] = None,
 ) -> None:
     """Pool worker: load diacritizer + optional cross-run SQLite lookup (speed)."""
+    # Force single-threaded ONNX to prevent context switch storms when running multiple workers
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
     global _worker_lookup_db
     _set_diacritize_worker_config(default_voice, rules_s, letter_s)
     get_local_nav_diacritizer(rules_s, letter_s)
     _worker_lookup_db = None
     if lookup_db_path:
         conn = sqlite3.connect(lookup_db_path, timeout=120.0, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        # Extreme performance mode for cache DB (sacrifices durability for speed)
+        conn.execute("PRAGMA journal_mode=MEMORY")
+        conn.execute("PRAGMA synchronous=OFF")
         conn.execute("CREATE TABLE IF NOT EXISTS d (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
         _worker_lookup_db = conn
 
@@ -1120,10 +1136,19 @@ def run_diacritize_phase(
     letter_s: Optional[str],
     workers: int,
     chunksize: int,
+    chunk_rows: int,
     show_progress: bool,
 ) -> None:
     """Phase 1: local_nav_diacritizer on raw CSV (ref. script); resume via *part_csv*."""
+    t_phase = time.time()
+    print(
+        "Phase-1: loading nav diacritizer rules + tashkeel ONNX (first run may build "
+        f"{Path(rules_s or 'nav_diacritizer_rules.json').name}.engine.pkl, ~1–3 min)…",
+        file=sys.stderr,
+        flush=True,
+    )
     _warm_arabic_diacritizer_stack(rules_s, letter_s)
+    print(f"Phase-1: parent warmup done in {time.time() - t_phase:.1f}s", file=sys.stderr, flush=True)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     lookup_db.parent.mkdir(parents=True, exist_ok=True)
     expected_rows = expected_diacritized_row_count(input_csv, limit)
@@ -1155,7 +1180,13 @@ def run_diacritize_phase(
     remaining_rows = max(0, expected_rows - resume_rows)
     print(
         f"Arabic phase-1 (local_nav_diacritizer): {remaining_rows} rows, {workers} workers, "
-        f"chunk={AR_DIACRITIZE_CHUNK_ROWS}, lookup={lookup_db.name} -> {output_csv.name}",
+        f"chunk={chunk_rows}, imap_chunksize={chunksize}, lookup={lookup_db.name} -> {output_csv.name}",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        f"Phase-1: starting {workers} worker processes (Linux fork inherits warmed model)…",
+        file=sys.stderr,
         flush=True,
     )
 
@@ -1168,7 +1199,10 @@ def run_diacritize_phase(
         "initargs": (default_voice, rules_s, letter_s, lookup_db_s),
     }
 
-    chunk_iter = iter_record_chunks(record_iter, AR_DIACRITIZE_CHUNK_ROWS)
+    chunk_iter = iter_record_chunks(record_iter, chunk_rows)
+    t_pool = time.time()
+    batches_done = 0
+    rows_done = 0
 
     with part_csv.open(write_mode, encoding="utf-8", newline="") as out_f:
         writer = csv.writer(out_f)
@@ -1181,13 +1215,22 @@ def run_diacritize_phase(
                 desc="Diacritize",
                 unit="row",
                 dynamic_ncols=True,
-                mininterval=0.5,
+                mininterval=0.25,
                 disable=False,
                 file=sys.stderr,
             )
         pending_flush = 0
         with mp_ctx.Pool(**pool_kwargs) as pool:
-            for out_rows in pool.imap(diacritize_chunk_task, chunk_iter, chunksize=chunksize):
+            for out_rows in pool.imap_unordered(diacritize_chunk_task, chunk_iter, chunksize=chunksize):
+                batches_done += 1
+                rows_done += len(out_rows)
+                if batches_done == 1:
+                    print(
+                        f"Phase-1: first batch ({len(out_rows)} rows) in {time.time() - t_pool:.1f}s "
+                        f"— progress bar will advance now",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 writer.writerows(out_rows)
                 if progress_bar is not None:
                     progress_bar.update(len(out_rows))
@@ -1197,6 +1240,12 @@ def run_diacritize_phase(
                     pending_flush = 0
         if progress_bar is not None:
             progress_bar.close()
+
+    print(
+        f"Phase-1: finished {rows_done:,} rows in {time.time() - t_phase:.1f}s total",
+        file=sys.stderr,
+        flush=True,
+    )
 
     if not diacritized_cache_is_complete(part_csv, expected_rows):
         raise RuntimeError(
@@ -1285,6 +1334,9 @@ def main() -> None:
         if args.diacritize_chunksize > 0
         else recommend_diacritize_chunksize(diacritize_workers)
     )
+    diacritize_chunk_rows = (
+        args.diacritize_chunk_rows if args.diacritize_chunk_rows > 0 else AR_DIACRITIZE_CHUNK_ROWS
+    )
     executor_name = args.executor
     executor_cls = ProcessPoolExecutor if executor_name == "process" else ThreadPoolExecutor
 
@@ -1328,6 +1380,7 @@ def main() -> None:
                 letter_s=letter_s,
                 workers=diacritize_workers,
                 chunksize=diacritize_chunksize,
+                chunk_rows=diacritize_chunk_rows,
                 show_progress=args.show_progress,
             )
         phonemize_csv = cache_csv
