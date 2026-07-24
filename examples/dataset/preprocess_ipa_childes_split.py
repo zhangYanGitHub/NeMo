@@ -1193,13 +1193,13 @@ def run_diacritize_phase(
         flush=True,
     )
     print(
-        f"Phase-1: starting {workers} worker processes (Linux fork inherits warmed model)…",
+        f"Phase-1: starting {workers} worker processes (using spawn to avoid ONNX fork deadlocks)…",
         file=sys.stderr,
         flush=True,
     )
 
-    use_fork = sys.platform == "linux"
-    mp_ctx = mp.get_context("fork") if use_fork else mp.get_context()
+    use_fork = False  # Force spawn to prevent ONNX Runtime deadlocks on Linux
+    mp_ctx = mp.get_context("fork") if use_fork else mp.get_context("spawn")
     lookup_db_s = str(lookup_db)
     pool_kwargs: Dict[str, object] = {
         "processes": workers,
