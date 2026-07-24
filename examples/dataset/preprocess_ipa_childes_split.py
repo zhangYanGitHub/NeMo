@@ -684,8 +684,11 @@ def _diacritize_with_lookup(raw: str) -> str:
     return result
 
 
+_worker_rows_processed = 0
+
 def diacritize_chunk_task(chunk: Sequence[Tuple[List[str], int, int]]) -> List[List[str]]:
     """Diacritize up to AR_DIACRITIZE_CHUNK_ROWS records; dedupe identical sentences in-chunk."""
+    global _worker_rows_processed
     unique_raws: Dict[str, str] = {}
     out_rows: List[List[str]] = []
     for row, text_idx, lang_idx in chunk:
@@ -695,10 +698,15 @@ def diacritize_chunk_task(chunk: Sequence[Tuple[List[str], int, int]]) -> List[L
             continue
         raw = row[text_idx]
         if raw not in unique_raws:
+            t0 = time.time()
             unique_raws[raw] = _diacritize_with_lookup(raw)
+            if _worker_rows_processed == 0:
+                import os
+                print(f"[Worker {os.getpid()}] First row ONNX inference took {time.time() - t0:.2f}s", file=sys.stderr, flush=True)
         new_row = list(row)
         new_row[text_idx] = unique_raws[raw]
         out_rows.append(new_row)
+        _worker_rows_processed += 1
     return out_rows
 
 
@@ -1221,6 +1229,8 @@ def run_diacritize_phase(
             )
         pending_flush = 0
         with mp_ctx.Pool(**pool_kwargs) as pool:
+            # 立即打印一行，确认 Pool 已经创建并开始喂数据
+            print("Phase-1: Pool created, feeding data to workers...", file=sys.stderr, flush=True)
             for out_rows in pool.imap_unordered(diacritize_chunk_task, chunk_iter, chunksize=chunksize):
                 batches_done += 1
                 rows_done += len(out_rows)
