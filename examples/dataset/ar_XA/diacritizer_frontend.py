@@ -13,6 +13,7 @@ Default resource paths live under ``examples/dataset/ar_XA/resources/``.
 from __future__ import annotations
 
 import json
+import pickle
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -45,14 +46,48 @@ def is_arabic_voice(voice_or_lang: str) -> bool:
     return key.startswith("ar-")
 
 
+def _engine_cache_path(rules_p: Path) -> Path:
+    return rules_p.with_name(f"{rules_p.stem}.engine.pkl")
+
+
+def _load_diacritizer_engine(rules_p: Path, letter_p: Path):
+    """Load ``LocalNavDiacritizer``, using a pickle sidecar to skip JSON parse + ngram prep."""
+    from ar_XA.local_nav_diacritizer import LocalNavDiacritizer, load_letter_map
+
+    cache_p = _engine_cache_path(rules_p)
+    rules_mtime = rules_p.stat().st_mtime
+    letter_mtime = letter_p.stat().st_mtime
+    letter_key = str(letter_p)
+    if cache_p.is_file():
+        try:
+            with cache_p.open("rb") as f:
+                cached_rules_mtime, cached_letter_mtime, cached_letter_key, engine = pickle.load(f)
+            if (
+                cached_rules_mtime == rules_mtime
+                and cached_letter_mtime == letter_mtime
+                and cached_letter_key == letter_key
+            ):
+                return engine
+        except (pickle.PickleError, EOFError, ValueError, TypeError):
+            pass
+
+    rules: Dict[str, Any] = json.loads(rules_p.read_text(encoding="utf-8"))
+    letter_map = load_letter_map(letter_p)
+    engine = LocalNavDiacritizer(rules, letter_map)
+    try:
+        with cache_p.open("wb") as f:
+            pickle.dump((rules_mtime, letter_mtime, letter_key, engine), f, protocol=pickle.HIGHEST_PROTOCOL)
+    except OSError:
+        pass
+    return engine
+
+
 @lru_cache(maxsize=4)
 def get_local_nav_diacritizer(
     rules_path: Optional[str] = None,
     letter_map_path: Optional[str] = None,
 ):
     """Lazy singleton ``LocalNavDiacritizer`` (rules + letter map loaded once per process)."""
-    from ar_XA.local_nav_diacritizer import LocalNavDiacritizer, load_letter_map
-
     default_rules, default_letter = default_diacritizer_paths()
     rules_p = Path(rules_path).expanduser().resolve() if rules_path else default_rules
     letter_p = Path(letter_map_path).expanduser().resolve() if letter_map_path else default_letter
@@ -60,9 +95,7 @@ def get_local_nav_diacritizer(
         raise FileNotFoundError(f"Arabic diacritizer rules not found: {rules_p}")
     if not letter_p.is_file():
         raise FileNotFoundError(f"Arabic letter map not found: {letter_p}")
-    rules: Dict[str, Any] = json.loads(rules_p.read_text(encoding="utf-8"))
-    letter_map = load_letter_map(letter_p)
-    return LocalNavDiacritizer(rules, letter_map)
+    return _load_diacritizer_engine(rules_p, letter_p)
 
 
 def reset_diacritizer_cache() -> None:

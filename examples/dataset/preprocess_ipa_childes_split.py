@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import functools
-import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -655,14 +654,10 @@ def _init_diacritize_worker(
         _worker_lookup_db = conn
 
 
-def _diacritize_lookup_key(raw: str) -> str:
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
 def _diacritize_with_lookup(raw: str) -> str:
     """Per-worker LRU + SQLite dedup; same logic as local_nav_diacritizer.diacritize_line."""
     db = _worker_lookup_db
-    key = _diacritize_lookup_key(raw)
+    key = raw
     if db is not None:
         row = db.execute("SELECT v FROM d WHERE k=?", (key,)).fetchone()
         if row is not None:
@@ -1092,8 +1087,15 @@ def process_raw_batch(
 
 
 def recommend_diacritize_workers(cpu_count: int) -> int:
-    """Arabic phase-1 is tashkeel-bound — use every core."""
-    return max(1, cpu_count)
+    """Arabic phase-1 is tashkeel-bound (ONNX).
+
+    Each worker loads rules + tashkeel; beyond ~4–8 workers memory and ONNX contention
+    usually dominate (especially on macOS spawn). Cap parallelism accordingly.
+    """
+    cpu_count = max(1, cpu_count)
+    if cpu_count <= 4:
+        return cpu_count
+    return min(8, max(4, cpu_count // 2))
 
 
 def recommend_diacritize_chunksize(workers: int) -> int:

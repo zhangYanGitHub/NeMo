@@ -153,6 +153,27 @@ class LocalNavDiacritizerTest(unittest.TestCase):
 
         self.assertEqual(engine.diacritize_line("انعطف."), "اِنْعَطِفْ.")
 
+    def test_unigram_uses_only_unigram_ngram_rules(self) -> None:
+        """Single-word rows have no cross-word context; n>=2 rules must not apply."""
+        key1 = nav.make_key(["كلمة"])
+        key2 = nav.make_key(["كلمة", "ثانية"])
+        engine = nav.LocalNavDiacritizer(
+            {
+                "line_rules": {},
+                "ngram_rules": {
+                    "1": {key1: nav.make_key(["كَلِمَة"])},
+                    "2": {key2: nav.make_key(["كَلِمَة", "ثَانِيَة"])},
+                },
+            },
+            {},
+        )
+
+        self.assertEqual(engine.diacritize_line("كلمة"), "كَلِمَة")
+        self.assertEqual(
+            engine.diacritize_line("كلمة ثانية"),
+            "كَلِمَة ثَانِيَة",
+        )
+
     def test_tashkeel_receives_text_without_existing_diacritics(self) -> None:
         inputs: list[str] = []
 

@@ -509,6 +509,13 @@ class LocalNavDiacritizer:
 
         proposed: dict[int, str] = {}
         all_word_indexes = word_indexes_in_order
+        indexes = rule_token_indexes(tokens)
+        # Single-word rows (general_words / POI): no cross-word context, so cap ngram
+        # at 1 — unless punctuation-aware rules apply (e.g. فهد + .), which need n>=2.
+        is_word_unigram = len(all_word_indexes) == 1
+        ngram_cap = 1 if is_word_unigram and len(indexes) == 1 else self.max_ngram
+        skip_fixed_override = is_word_unigram and len(indexes) == 1
+
         for word_indexes in word_segments(tokens):
             plain_words = [tokens[idx].plain for idx in word_indexes]
 
@@ -532,7 +539,6 @@ class LocalNavDiacritizer:
 
                 i += 1
 
-        indexes = rule_token_indexes(tokens)
         rule_plain = [
             tokens[idx].plain if tokens[idx].kind == "word" else tokens[idx].text
             for idx in indexes
@@ -540,7 +546,7 @@ class LocalNavDiacritizer:
         i = 0
         while i < len(indexes):
             matched = False
-            max_n = min(self.max_ngram, len(indexes) - i)
+            max_n = min(ngram_cap, len(indexes) - i)
             for n in range(max_n, 0, -1):
                 table = self.ngram_rules.get(n)
                 if not table:
@@ -559,23 +565,24 @@ class LocalNavDiacritizer:
             if not matched:
                 i += 1
 
-        for word_indexes in word_segments(tokens):
-            plain_words = [tokens[idx].plain for idx in word_indexes]
-            # Fixed phrases override statistical matches, but stay within the
-            # current punctuation-delimited segment.
-            fixed_lengths = sorted(self.fixed_rules.keys(), reverse=True)
-            for i in range(len(word_indexes)):
-                for n in fixed_lengths:
-                    if i + n > len(word_indexes):
-                        continue
-                    diac_words = self._fixed_reading(
-                        plain_words, i, n, word_indexes, tokens
-                    )
-                    if not diac_words:
-                        continue
-                    for offset, diac_word in enumerate(diac_words):
-                        proposed[word_indexes[i + offset]] = diac_word
-                    break
+        if not skip_fixed_override:
+            for word_indexes in word_segments(tokens):
+                plain_words = [tokens[idx].plain for idx in word_indexes]
+                # Fixed phrases override statistical matches, but stay within the
+                # current punctuation-delimited segment.
+                fixed_lengths = sorted(self.fixed_rules.keys(), reverse=True)
+                for i in range(len(word_indexes)):
+                    for n in fixed_lengths:
+                        if i + n > len(word_indexes):
+                            continue
+                        diac_words = self._fixed_reading(
+                            plain_words, i, n, word_indexes, tokens
+                        )
+                        if not diac_words:
+                            continue
+                        for offset, diac_word in enumerate(diac_words):
+                            proposed[word_indexes[i + offset]] = diac_word
+                        break
 
         # Run Tashkeel only when at least one word is not covered by rules.
         if any(idx not in proposed for idx in all_word_indexes):
