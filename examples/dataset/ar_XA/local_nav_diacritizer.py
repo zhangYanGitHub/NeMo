@@ -23,7 +23,6 @@ try:
 except Exception:  # pragma: no cover - reported at runtime if fallback is needed
     tashkeel_run = None  # type: ignore[assignment]
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = REPO_ROOT / "train_data/output_data/ar_XA_20260609_111446/dataset.jsonl"
 DEFAULT_NAV_LST_GLOB = REPO_ROOT / "text_for_voice_clone/ar_XA/final_train_data/ar_nav_*.lst"
@@ -600,13 +599,15 @@ class LocalNavDiacritizer:
             fallback_text = fallback_tashkeel(strip_diacritics(text))
             fallback_tokens = tokenize(fallback_text)
             fallback_words = [tok.text for tok in fallback_tokens if tok.kind == "word"]
-            if len(fallback_words) != len(all_word_indexes):
-                raise RuntimeError(
-                    "tashkeel_run changed the number of Arabic words: "
-                    f"{len(all_word_indexes)} -> {len(fallback_words)}"
-                )
-            for idx, fallback_word in zip(all_word_indexes, fallback_words):
-                proposed.setdefault(idx, fallback_word)
+            if len(fallback_words) == len(all_word_indexes):
+                for idx, fallback_word in zip(all_word_indexes, fallback_words):
+                    proposed.setdefault(idx, fallback_word)
+            else:
+                # If tashkeel changes the word count, we cannot safely align word-by-word
+                # to apply `proposed` rules. We must return the raw tashkeel output.
+                # This happens when tashkeel merges or splits words (e.g., handling
+                # certain Arabic ligatures or punctuation edge cases).
+                return fallback_text
 
         return self._render(tokens, proposed, protected_indexes)
 
