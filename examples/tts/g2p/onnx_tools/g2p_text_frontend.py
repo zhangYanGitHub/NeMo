@@ -432,8 +432,8 @@ def text_to_segments(
     *,
     diacritize_arabic: Optional[bool] = None,
 ) -> List[str]:
-    """Full inference frontend == training data prep:
-    normalize_text -> [ar: local_nav_diacritizer] -> normalize_for_g2p(locale) -> split_into_segments.
+    """Full inference frontend == training data prep (ar matches run_ar_XA_diacritized.sh):
+    diacritize -> normalize_text -> normalize_for_g2p -> split_into_segments.
     Returns the punctuation-free, TN'd segments to send to the model one by one.
     locale ('en'/'de'/'fr'/'ar') MUST match lang_config.json's number_locale for the language."""
     if diacritize_arabic is None:

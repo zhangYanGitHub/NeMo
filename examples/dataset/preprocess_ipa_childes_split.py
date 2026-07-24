@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import csv
 import functools
+import hashlib
 import json
 import multiprocessing as mp
 import os
 import re
+import sqlite3
 import sys
 import unicodedata
 from collections import Counter
@@ -28,10 +30,19 @@ STRESS = {PRIMARY_STRESS, SECONDARY_STRESS}
 LENGTH = "\u02d0"  # ː
 SPECIAL_TOKENS = ("<pad>", "<unk>")
 MANIFEST_WRITE_BUFFER_LINES = 1024
-# Arabic phase-1: small batches balance slow tashkeel rows across workers.
-AR_DIACRITIZE_BATCH_SIZE = 8
+# Arabic phase-1 (local_nav_diacritizer, ref. run_ar_XA_diacritized.sh):
+#   diacritize raw CSV -> cache; phase-2 does normalize_text + normalize_for_g2p + espeak.
+AR_DIACRITIZE_CHUNK_ROWS = 256
+AR_DIACRITIZE_DEFAULT_CHUNKSIZE = 4
+AR_DIACRITIZE_LRU_SIZE = 262144
 AR_DIACRITIZED_CACHE_SUFFIX = ".diacritized.csv"
 AR_DIACRITIZED_PART_SUFFIX = ".diacritized.part.csv"
+AR_DIACRITIZED_LOOKUP_SUFFIX = ".diacritized.lookup.sqlite"
+# Picklable imap worker state (set via pool initializer).
+_DIA_CRIT_DEFAULT_VOICE = ""
+_DIA_CRIT_RULES_S: Optional[str] = None
+_DIA_CRIT_LETTER_S: Optional[str] = None
+_worker_lookup_db: Optional[sqlite3.Connection] = None
 
 # EVERYTHING language-specific (espeak voice, number-normalization locale, the multi-character
 # phoneme atom whitelist, and the self-check regression cases) lives in lang_config.json, NOT
@@ -410,6 +421,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=0, help="parallel workers; 0 means auto by CPU count")
     parser.add_argument(
+        "--diacritize-workers",
+        type=int,
+        default=0,
+        help="Arabic phase-1 workers; 0 means use all CPU cores (fastest for tashkeel)",
+    )
+    parser.add_argument(
+        "--diacritize-chunksize",
+        type=int,
+        default=0,
+        help="Arabic phase-1 Pool.imap chunksize; 0 means auto (typically 4–8)",
+    )
+    parser.add_argument(
         "--executor",
         choices=["thread", "process"],
         default="process",
@@ -613,17 +636,76 @@ def run_phonemize_batch(texts: Sequence[str], voice: str) -> List[str]:
     return out
 
 
-def _pool_worker_init_diacritizer(
-    rules_path: Optional[str],
-    letter_map_path: Optional[str],
+def _init_diacritize_worker(
+    default_voice: str,
+    rules_s: Optional[str],
+    letter_s: Optional[str],
+    lookup_db_path: Optional[str] = None,
 ) -> None:
-    """ProcessPool worker hook: load diacritizer rules once per worker before any batch."""
-    from ar_XA.diacritizer_frontend import get_local_nav_diacritizer
+    """Pool worker: load diacritizer + optional cross-run SQLite lookup (speed)."""
+    global _worker_lookup_db
+    _set_diacritize_worker_config(default_voice, rules_s, letter_s)
+    get_local_nav_diacritizer(rules_s, letter_s)
+    _worker_lookup_db = None
+    if lookup_db_path:
+        conn = sqlite3.connect(lookup_db_path, timeout=120.0, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("CREATE TABLE IF NOT EXISTS d (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        _worker_lookup_db = conn
 
-    get_local_nav_diacritizer(rules_path, letter_map_path)
+
+def _diacritize_lookup_key(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-@functools.lru_cache(maxsize=131072)
+def _diacritize_with_lookup(raw: str) -> str:
+    """Per-worker LRU + SQLite dedup; same logic as local_nav_diacritizer.diacritize_line."""
+    db = _worker_lookup_db
+    key = _diacritize_lookup_key(raw)
+    if db is not None:
+        row = db.execute("SELECT v FROM d WHERE k=?", (key,)).fetchone()
+        if row is not None:
+            return row[0]
+    result = _diacritize_line_cached(raw, _DIA_CRIT_RULES_S, _DIA_CRIT_LETTER_S)
+    if db is not None:
+        db.execute("INSERT OR REPLACE INTO d (k, v) VALUES (?, ?)", (key, result))
+    return result
+
+
+def diacritize_chunk_task(chunk: Sequence[Tuple[List[str], int, int]]) -> List[List[str]]:
+    """Diacritize up to AR_DIACRITIZE_CHUNK_ROWS records; dedupe identical sentences in-chunk."""
+    unique_raws: Dict[str, str] = {}
+    out_rows: List[List[str]] = []
+    for row, text_idx, lang_idx in chunk:
+        lang = row[lang_idx].strip() if lang_idx < len(row) else ""
+        if not is_arabic_voice(lang or _DIA_CRIT_DEFAULT_VOICE):
+            out_rows.append(row)
+            continue
+        raw = row[text_idx]
+        if raw not in unique_raws:
+            unique_raws[raw] = _diacritize_with_lookup(raw)
+        new_row = list(row)
+        new_row[text_idx] = unique_raws[raw]
+        out_rows.append(new_row)
+    return out_rows
+
+
+def iter_record_chunks(
+    record_iter: Iterator[Tuple[List[str], int, int]],
+    chunk_rows: int,
+) -> Iterator[List[Tuple[List[str], int, int]]]:
+    chunk: List[Tuple[List[str], int, int]] = []
+    for item in record_iter:
+        chunk.append(item)
+        if len(chunk) >= chunk_rows:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+@functools.lru_cache(maxsize=AR_DIACRITIZE_LRU_SIZE)
 def _diacritize_line_cached(
     raw: str,
     rules_path: Optional[str],
@@ -633,15 +715,31 @@ def _diacritize_line_cached(
     return diacritize_arabic_line(raw, rules_path=rules_path, letter_map_path=letter_map_path)
 
 
-def _diacritize_pool_context(
-    executor_name: str,
+def _warm_arabic_diacritizer_stack(rules_s: Optional[str], letter_s: Optional[str]) -> None:
+    """Load rules + tashkeel ONNX once in the parent (Linux fork workers inherit via COW)."""
+    get_local_nav_diacritizer(rules_s, letter_s)
+    try:
+        from ar_XA.local_nav_diacritizer import fallback_tashkeel
+
+        fallback_tashkeel("مرحبا")
+    except Exception:
+        pass
+
+
+def _set_diacritize_worker_config(
+    default_voice: str,
     rules_s: Optional[str],
     letter_s: Optional[str],
-) -> Tuple[Optional[mp.context.BaseContext], Optional[Callable], Tuple]:
-    """Return (mp_context, pool_initializer, pool_initargs) for Arabic diacritizer workers."""
-    if executor_name == "process" and sys.platform == "linux":
-        return mp.get_context("fork"), None, ()
-    return None, _pool_worker_init_diacritizer, (rules_s, letter_s)
+) -> None:
+    global _DIA_CRIT_DEFAULT_VOICE, _DIA_CRIT_RULES_S, _DIA_CRIT_LETTER_S
+    _DIA_CRIT_DEFAULT_VOICE = default_voice
+    _DIA_CRIT_RULES_S = rules_s
+    _DIA_CRIT_LETTER_S = letter_s
+
+
+def diacritize_record_task(item: Tuple[List[str], int, int]) -> List[str]:
+    """imap task: diacritize one CSV record (Arabic rows only). Kept for tests."""
+    return diacritize_chunk_task([item])[0]
 
 
 def _prepare_row_segments(
@@ -669,8 +767,11 @@ def _prepare_row_segments(
     # Grapheme input and phonemize input are the same normalized text
     # (no letter-"A" / "A-" special-casing): the model sees exactly the
     # text espeak phonemizes into the target.
-    text = normalize_for_g2p(raw_for_row, locale=number_locale) if normalize_nums else raw_for_row
-    text = normalize_text(text)
+    # Order MUST match g2p_text_frontend.prepare_arabic_grapheme_text:
+    #   diacritize -> normalize_text (NFC/space) -> normalize_for_g2p (digits/codes -> words)
+    text = normalize_text(raw_for_row)
+    if normalize_nums:
+        text = normalize_for_g2p(text, locale=number_locale)
 
     if split_punct:
         return [(lang, seg, seg) for seg in split_into_segments(text) if seg]
@@ -692,11 +793,12 @@ def iter_csv_raw_rows(
         yield lang, row[text_idx]
 
 
-def diacritized_cache_paths(output_dir: Path, input_stem: str) -> Tuple[Path, Path]:
-    """Return (final_cache_csv, in_progress_part_csv) for Arabic phase-1."""
+def diacritized_cache_paths(output_dir: Path, input_stem: str) -> Tuple[Path, Path, Path]:
+    """Return (final_csv, in_progress_part_csv, lookup_sqlite) for Arabic phase-1."""
     final_csv = output_dir / f"{input_stem}{AR_DIACRITIZED_CACHE_SUFFIX}"
     part_csv = output_dir / f"{input_stem}{AR_DIACRITIZED_PART_SUFFIX}"
-    return final_csv, part_csv
+    lookup_db = output_dir / f"{input_stem}{AR_DIACRITIZED_LOOKUP_SUFFIX}"
+    return final_csv, part_csv, lookup_db
 
 
 def expected_diacritized_row_count(input_csv: Path, limit: int) -> int:
@@ -712,9 +814,9 @@ def diacritized_cache_is_complete(cache_csv: Path, expected_rows: int) -> bool:
     return approx_csv_body_line_count(cache_csv) == expected_rows
 
 
-def clear_diacritized_cache_files(cache_csv: Path, part_csv: Path) -> None:
-    for path in (cache_csv, part_csv):
-        if path.is_file():
+def clear_diacritized_cache_files(cache_csv: Path, part_csv: Path, lookup_db: Optional[Path] = None) -> None:
+    for path in (cache_csv, part_csv, lookup_db):
+        if path is not None and path.is_file():
             path.unlink()
 
 
@@ -989,29 +1091,25 @@ def process_raw_batch(
     )
 
 
-def diacritize_records_batch(
-    batch_items: Sequence[Tuple[List[str], int, int]],
-    default_voice: str,
-    diacritizer_rules: Optional[str],
-    diacritizer_letter_map: Optional[str],
-) -> List[List[str]]:
-    """Arabic phase-1: diacritize text column for Arabic-voice rows; other rows pass through."""
-    out_rows: List[List[str]] = []
-    for row, text_idx, lang_idx in batch_items:
-        lang = row[lang_idx].strip() if lang_idx < len(row) else ""
-        if is_arabic_voice(lang or default_voice):
-            new_row = list(row)
-            new_row[text_idx] = _diacritize_line_cached(row[text_idx], diacritizer_rules, diacritizer_letter_map)
-            out_rows.append(new_row)
-        else:
-            out_rows.append(row)
-    return out_rows
+def recommend_diacritize_workers(cpu_count: int) -> int:
+    """Arabic phase-1 is tashkeel-bound — use every core."""
+    return max(1, cpu_count)
+
+
+def recommend_diacritize_chunksize(workers: int) -> int:
+    """Pool.imap chunksize: bundle a few rows per scheduling round."""
+    if workers >= 64:
+        return 8
+    if workers >= 16:
+        return 4
+    return AR_DIACRITIZE_DEFAULT_CHUNKSIZE
 
 
 def run_diacritize_phase(
     input_csv: Path,
     output_csv: Path,
     part_csv: Path,
+    lookup_db: Path,
     text_field: str,
     lang_field: str,
     limit: int,
@@ -1019,12 +1117,13 @@ def run_diacritize_phase(
     rules_s: Optional[str],
     letter_s: Optional[str],
     workers: int,
-    executor_name: str,
+    chunksize: int,
     show_progress: bool,
 ) -> None:
-    """Phase 1 (Arabic only): parallel diacritization; resume via *part_csv*, finalize to *output_csv*."""
-    get_local_nav_diacritizer(rules_s, letter_s)
+    """Phase 1: local_nav_diacritizer on raw CSV (ref. script); resume via *part_csv*."""
+    _warm_arabic_diacritizer_stack(rules_s, letter_s)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
+    lookup_db.parent.mkdir(parents=True, exist_ok=True)
     expected_rows = expected_diacritized_row_count(input_csv, limit)
 
     with input_csv.open("r", encoding="utf-8", newline="") as src:
@@ -1052,59 +1151,50 @@ def run_diacritize_phase(
 
     record_iter = iter_csv_record_rows(input_csv, text_field, lang_field, limit, skip=resume_rows)
     remaining_rows = max(0, expected_rows - resume_rows)
-    if show_progress:
-        est_batches = max(1, (remaining_rows + AR_DIACRITIZE_BATCH_SIZE - 1) // AR_DIACRITIZE_BATCH_SIZE)
-        print(
-            f"Arabic phase-1 diacritization: {remaining_rows} rows remaining -> {output_csv.name}",
-            file=sys.stderr,
-            flush=True,
-        )
-    else:
-        est_batches = None
-
-    batch_iter = iter_batches(
-        ((row, text_idx, lang_idx) for row, text_idx, lang_idx in record_iter),
-        AR_DIACRITIZE_BATCH_SIZE,
-    )
-    diacritize_fn = functools.partial(
-        diacritize_records_batch,
-        default_voice=default_voice,
-        diacritizer_rules=rules_s,
-        diacritizer_letter_map=letter_s,
+    print(
+        f"Arabic phase-1 (local_nav_diacritizer): {remaining_rows} rows, {workers} workers, "
+        f"chunk={AR_DIACRITIZE_CHUNK_ROWS}, lookup={lookup_db.name} -> {output_csv.name}",
+        flush=True,
     )
 
-    mp_context, pool_initializer, pool_initargs = _diacritize_pool_context(executor_name, rules_s, letter_s)
-    executor_cls = ProcessPoolExecutor if executor_name == "process" else ThreadPoolExecutor
-    executor_kwargs = {"max_workers": workers, "initializer": pool_initializer, "initargs": pool_initargs}
-    if mp_context is not None:
-        executor_kwargs["mp_context"] = mp_context
+    use_fork = sys.platform == "linux"
+    mp_ctx = mp.get_context("fork") if use_fork else mp.get_context()
+    lookup_db_s = str(lookup_db)
+    pool_kwargs: Dict[str, object] = {
+        "processes": workers,
+        "initializer": _init_diacritize_worker,
+        "initargs": (default_voice, rules_s, letter_s, lookup_db_s),
+    }
+
+    chunk_iter = iter_record_chunks(record_iter, AR_DIACRITIZE_CHUNK_ROWS)
 
     with part_csv.open(write_mode, encoding="utf-8", newline="") as out_f:
         writer = csv.writer(out_f)
         if write_mode == "w":
             writer.writerow(header)
-        with executor_cls(**executor_kwargs) as executor:
-            progress_bar = None
-            if show_progress:
-                progress_bar = tqdm(
-                    total=est_batches,
-                    desc="Diacritize",
-                    unit="batch",
-                    dynamic_ncols=True,
-                    mininterval=0.25,
-                    disable=False,
-                    file=sys.stderr,
-                )
-            for batch_rows in ordered_map_batches(
-                executor,
-                max(1, workers * 4),
-                batch_iter,
-                diacritize_fn,
-                on_batch_complete=(progress_bar.update if progress_bar is not None else None),
-            ):
-                writer.writerows(batch_rows)
-            if progress_bar is not None:
-                progress_bar.close()
+        progress_bar = None
+        if show_progress:
+            progress_bar = tqdm(
+                total=remaining_rows,
+                desc="Diacritize",
+                unit="row",
+                dynamic_ncols=True,
+                mininterval=0.5,
+                disable=False,
+                file=sys.stderr,
+            )
+        pending_flush = 0
+        with mp_ctx.Pool(**pool_kwargs) as pool:
+            for out_rows in pool.imap(diacritize_chunk_task, chunk_iter, chunksize=chunksize):
+                writer.writerows(out_rows)
+                if progress_bar is not None:
+                    progress_bar.update(len(out_rows))
+                pending_flush += len(out_rows)
+                if pending_flush >= 2048:
+                    out_f.flush()
+                    pending_flush = 0
+        if progress_bar is not None:
+            progress_bar.close()
 
     if not diacritized_cache_is_complete(part_csv, expected_rows):
         raise RuntimeError(
@@ -1185,6 +1275,14 @@ def main() -> None:
     auto_workers, auto_batch_size = recommend_runtime(cpu_count)
     workers = args.workers if args.workers > 0 else auto_workers
     batch_size = args.batch_size if args.batch_size > 0 else auto_batch_size
+    diacritize_workers = (
+        args.diacritize_workers if args.diacritize_workers > 0 else recommend_diacritize_workers(cpu_count)
+    )
+    diacritize_chunksize = (
+        args.diacritize_chunksize
+        if args.diacritize_chunksize > 0
+        else recommend_diacritize_chunksize(diacritize_workers)
+    )
     executor_name = args.executor
     executor_cls = ProcessPoolExecutor if executor_name == "process" else ThreadPoolExecutor
 
@@ -1201,10 +1299,10 @@ def main() -> None:
         phonemize_csv = args.diacritized_csv.expanduser().resolve()
         print(f"Using pre-diacritized CSV for phonemize: {phonemize_csv}", flush=True)
     elif run_ar_diacritize_phase:
-        cache_csv, part_csv = diacritized_cache_paths(output_dir, input_csv.stem)
+        cache_csv, part_csv, lookup_db = diacritized_cache_paths(output_dir, input_csv.stem)
         expected_rows = expected_diacritized_row_count(input_csv, args.limit)
         if args.refresh_diacritize_cache:
-            clear_diacritized_cache_files(cache_csv, part_csv)
+            clear_diacritized_cache_files(cache_csv, part_csv, lookup_db)
         if diacritized_cache_is_complete(cache_csv, expected_rows):
             print(f"Reusing diacritized cache: {cache_csv}", flush=True)
         else:
@@ -1219,19 +1317,20 @@ def main() -> None:
                 input_csv=input_csv,
                 output_csv=cache_csv,
                 part_csv=part_csv,
+                lookup_db=lookup_db,
                 text_field=args.text_field,
                 lang_field=args.lang_field,
                 limit=args.limit,
                 default_voice=default_voice,
                 rules_s=rules_s,
                 letter_s=letter_s,
-                workers=workers,
-                executor_name=executor_name,
+                workers=diacritize_workers,
+                chunksize=diacritize_chunksize,
                 show_progress=args.show_progress,
             )
         phonemize_csv = cache_csv
 
-    # Phase 2 (all languages): TN + segment + espeak phonemize — same path for en/de/fr/ar.
+    # Phase 2 (all languages): ref. script TN after diacritize — normalize_text + normalize_for_g2p + espeak.
     process_fn = functools.partial(
         process_raw_batch,
         default_voice=default_voice,
@@ -1355,9 +1454,11 @@ def main() -> None:
         f"[(en) 语言切换 / 越界外语音素；'?' 已放开保留]"
     )
     print(
-        f"CPU: {cpu_count}, workers: {workers}, executor: {args.executor}, "
-        f"batch size: {batch_size}"
+        f"CPU: {cpu_count}, phonemize workers: {workers}, executor: {args.executor}, "
+        f"phonemize batch size: {batch_size}"
     )
+    if run_ar_diacritize_phase or args.diacritized_csv is not None:
+        print(f"Arabic diacritize workers: {diacritize_workers}, imap chunksize: {diacritize_chunksize}")
     print(f"Strip punctuation: {args.strip_punctuation} (no punctuation tokens in text_graphemes/text)")
     print(f"Split on punctuation: {args.split_on_punctuation} (one manifest line per segment; train==serve)")
     print(f"Normalize numbers: {args.normalize_numbers} (digits/codes -> words; MUST match frontend TN)")
